@@ -102,26 +102,47 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
     attempts = []
     force_cpu = os.environ.get("DUB_FORCE_CPU") == "1"
     if force_cpu:
-        _log("[FASTER-WHISPER] DUB_FORCE_CPU=1 — using CPU (int8).")
+        _log("[FASTER-WHISPER] GPU DISABLED: DUB_FORCE_CPU=1 is set — a "
+             "previous GPU crash pinned this run to CPU (or you forced it). "
+             "Transcribing on CPU (int8).")
     else:
+        # faster-whisper uses CTranslate2, which bundles its OWN CUDA runtime
+        # and detects the GPU independently of torch. So GPU transcription can
+        # work even when torch is a CPU-only build.
+        ct2 = None
         try:
-            import ctranslate2
-            if ctranslate2.get_cuda_device_count() > 0:
+            import ctranslate2 as ct2
+        except Exception as e:
+            _log(f"[FASTER-WHISPER] GPU CHECK: could not import ctranslate2 "
+                 f"({e}) — cannot use GPU. Transcribing on CPU (int8).")
+        if ct2 is not None:
+            try:
+                cuda_count = ct2.get_cuda_device_count()
+            except Exception as e:
+                _log(f"[FASTER-WHISPER] GPU CHECK: ctranslate2 could not query "
+                     f"CUDA devices ({e}) — Transcribing on CPU (int8).")
+                cuda_count = 0
+            if cuda_count > 0:
                 try:
                     gpu_types = set(
-                        ctranslate2.get_supported_compute_types("cuda", 0))
+                        ct2.get_supported_compute_types("cuda", 0))
                 except Exception:
                     gpu_types = set()
                 # Preferred order; keep only those the GPU reports as supported
                 # (fall back to trying them all if the query returned nothing).
                 pref = ["float16", "int8_float16", "int8_float32", "float32"]
                 gpu_order = [t for t in pref if t in gpu_types] or pref
-                _log(f"[FASTER-WHISPER] GPU compute types available: "
-                     f"{sorted(gpu_types) or 'unknown'} → trying {gpu_order}")
+                _log(f"[FASTER-WHISPER] GPU DETECTED: {cuda_count} CUDA "
+                     f"device(s). Supported compute types: "
+                     f"{sorted(gpu_types) or 'unknown'} → will try {gpu_order} "
+                     f"on GPU first, then CPU as a fallback.")
                 for ct in gpu_order:
                     attempts.append(("cuda", ct))
-        except Exception:
-            pass
+            else:
+                _log("[FASTER-WHISPER] NO GPU: ctranslate2 reports 0 CUDA "
+                     "devices. Likely causes: no NVIDIA GPU, the NVIDIA "
+                     "driver/CUDA runtime isn't installed, or the GPU isn't "
+                     "visible to this process. Transcribing on CPU (int8).")
     # CPU last-resort (also the only entry when no GPU / forced CPU).
     attempts.append(("cpu", "int8"))
 
@@ -132,6 +153,7 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
     _src = f"local:{local}" if local else f"hub:{model_size}"
 
     model = None
+    gpu_errors = []
     device, compute_type = attempts[-1]
     for i, (dev, ct) in enumerate(attempts):
         _log(f"[FASTER-WHISPER] Loading model '{model_size}' from {_src} "
@@ -139,13 +161,26 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
         try:
             model = WhisperModel(model_ref, device=dev, compute_type=ct)
             device, compute_type = dev, ct
+            if dev == "cuda":
+                _log(f"[FASTER-WHISPER] >>> Using GPU (CUDA, {ct}).")
+            elif gpu_errors:
+                _log("[FASTER-WHISPER] >>> Using CPU (int8). A GPU was detected "
+                     "but EVERY GPU compute type failed to load — reasons: "
+                     + " | ".join(gpu_errors))
+            else:
+                _log("[FASTER-WHISPER] >>> Using CPU (int8).")
             break
         except Exception as load_err:
             last = (i == len(attempts) - 1)
+            if dev == "cuda":
+                gpu_errors.append(f"{ct}: {load_err}")
+                _log(f"[FASTER-WHISPER] GPU load FAILED (device={dev}, "
+                     f"compute_type={ct}): {load_err}")
             if last:
                 raise
-            _log(f"[FASTER-WHISPER] {dev}/{ct} load failed ({load_err}); "
-                 f"trying next.")
+            if dev != "cuda":
+                _log(f"[FASTER-WHISPER] {dev}/{ct} load failed ({load_err}); "
+                     f"trying next.")
 
     _log(f"[FASTER-WHISPER] Transcribing: {audio_path}")
     try:
@@ -159,8 +194,10 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
         segments = list(segments)
     except Exception as run_err:
         if device == "cuda":
-            _log(f"[FASTER-WHISPER] CUDA transcribe failed ({run_err}); "
-                 f"reloading on CPU (int8).")
+            _log(f"[FASTER-WHISPER] GPU transcription FAILED at run time "
+                 f"({run_err}) — the model loaded on GPU but crashed while "
+                 f"decoding (often an old GPU arch with no CTranslate2 kernels, "
+                 f"or low VRAM). Reloading on CPU (int8).")
             model = WhisperModel(model_ref, device="cpu", compute_type="int8")
             segments, _info = model.transcribe(
                 audio_path,
@@ -168,6 +205,8 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
                 language=language,
             )
             segments = list(segments)
+            _log("[FASTER-WHISPER] >>> Using CPU (int8) after GPU run-time "
+                 "failure.")
         else:
             raise
 
@@ -372,7 +411,28 @@ def _diarize_turns(audio_path: str, hf_token: str,
         return None
 
     force_cpu = os.environ.get("DUB_FORCE_CPU") == "1"
-    use_cuda = torch.cuda.is_available() and not force_cpu
+    cuda_ok = bool(torch.cuda.is_available())
+    torch_cuda = getattr(getattr(torch, "version", None), "cuda", None)
+    if force_cpu:
+        _log("[DIARIZE] GPU DISABLED: DUB_FORCE_CPU=1 — diarizing on CPU.")
+    elif not cuda_ok:
+        # pyannote is torch-based, so diarization can ONLY use the GPU if this
+        # is a CUDA-enabled torch build. Explain the most common cause clearly.
+        if torch_cuda is None or "+cpu" in str(torch.__version__):
+            why = ("this is a CPU-ONLY torch build (torch.version.cuda is "
+                   "None) — install a CUDA torch build into setup/dub_venv to "
+                   "enable GPU diarization")
+        else:
+            why = ("no CUDA GPU is visible to torch (driver/runtime issue or "
+                   "no NVIDIA GPU)")
+        _log(f"[DIARIZE] NO GPU for diarization: torch.cuda.is_available()="
+             f"False — {why}. (torch={torch.__version__}, "
+             f"torch CUDA={torch_cuda}). Diarizing on CPU.")
+    else:
+        _log(f"[DIARIZE] GPU DETECTED for diarization: torch "
+             f"{torch.__version__} (CUDA {torch_cuda}) → using GPU.")
+
+    use_cuda = cuda_ok and not force_cpu
     device = torch.device("cuda" if use_cuda else "cpu")
     try:
         pipeline.to(device)

@@ -917,6 +917,27 @@ def transcribe_video(video_path: Path, settings: dict, log=None,
             log('error', f'Dub: whisper error (rc={result.returncode}): '
                         f'{result.stderr[:300]}')
             return []
+
+        # Surface the GPU/CPU decision from the subprocess stderr so the user
+        # can SEE whether the GPU was used — and, if not, WHY. We forward the
+        # decisive marker lines (device chosen, GPU detected/skipped/failed).
+        try:
+            for _line in (result.stderr or '').splitlines():
+                s = _line.strip()
+                if not s:
+                    continue
+                if ('>>> Using' in s or 'GPU DETECTED' in s
+                        or 'NO GPU' in s or 'GPU DISABLED' in s
+                        or 'GPU load FAILED' in s
+                        or 'GPU transcription FAILED' in s):
+                    # Strip the "[FASTER-WHISPER] " / "[DIARIZE] " prefix noise.
+                    msg = s.split('] ', 1)[-1] if '] ' in s else s
+                    lvl = 'warn' if ('FAILED' in s or 'NO GPU' in s
+                                     or 'DISABLED' in s) else 'info'
+                    log(lvl, f'Dub: {msg}')
+        except Exception:
+            pass
+
         word_timings = json.loads(result.stdout)
         if not isinstance(word_timings, list):
             log('error', 'Dub: whisper returned non-list output')
