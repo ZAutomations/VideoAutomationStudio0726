@@ -297,7 +297,37 @@ def _resolve_voice_settings(settings: dict, voice):
             seg['tts_engine'] = 'google_cloud'   # gemini path
             seg['gemini_tts_voice'] = base_voice
         return seg, float(semis)
+    # Engine-prefixed keys from the dubbing tab's per-speaker dropdown:
+    #   "edge:aria"  "kokoro:af_bella"  "piper:en_US-ryan-medium"  "gemini:Puck"
+    # Route each to its TTS engine so a speaker can be voiced by Edge, Kokoro
+    # or Piper instead of Gemini.  ``tts_engine`` is set explicitly so it does
+    # NOT inherit whatever the 🗣 TTS tab happens to be on.
+    vs = str(voice)
+    if ':' in vs:
+        engine, _, vid = vs.partition(':')
+        engine = engine.strip().lower()
+        vid = vid.strip()
+        seg = dict(settings)
+        if engine == 'edge':
+            seg['tts_engine'] = 'cloud'
+            seg['tts_voice'] = vid
+            return seg, 0.0
+        if engine == 'kokoro':
+            seg['tts_engine'] = 'local'
+            seg['kokoro_voice'] = vid
+            return seg, 0.0
+        if engine == 'piper':
+            seg['tts_engine'] = 'piper'
+            seg['piper_voice'] = vid
+            return seg, 0.0
+        if engine == 'gemini':
+            seg['tts_engine'] = 'google_cloud'
+            seg['gemini_tts_voice'] = vid
+            return seg, 0.0
+        # Unknown prefix — fall through to the Gemini default below.
+    # Plain (unprefixed) key = a Gemini voice.
     seg = dict(settings)
+    seg['tts_engine'] = 'google_cloud'
     seg['gemini_tts_voice'] = voice
     return seg, 0.0
 

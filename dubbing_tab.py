@@ -38,6 +38,39 @@ AppStyles = None
 ModernButton = None
 
 
+# ── Non-Gemini dubbing voices ────────────────────────────────────────────
+# Per-speaker dropdowns can voice a speaker with Edge / Kokoro / Piper too,
+# not just Gemini.  Keys are stored as "<engine>:<id>" and routed by
+# dubbing_engine._resolve_voice_settings().  These lists are CURATED (not the
+# full catalogs) so the dropdown stays usable; the 🗣 TTS tab still exposes
+# every voice for single-speaker dubbing.
+_DUB_EDGE_VOICES = [
+    # id (alias into TTSGenerator.VOICES)   gender
+    ('aria', 'Female'), ('jenny', 'Female'), ('michelle', 'Female'),
+    ('emma', 'Female'), ('ana', 'Female'),
+    ('guy', 'Male'), ('eric', 'Male'), ('christopher', 'Male'),
+    ('andrew', 'Male'), ('brian', 'Male'), ('roger', 'Male'),
+    ('sonia', 'Female'), ('libby', 'Female'), ('ryan', 'Male'), ('thomas', 'Male'),
+    ('natasha', 'Female'), ('william', 'Male'),
+    ('neerja', 'Female'), ('prabhat', 'Male'),
+    ('madhur', 'Male'), ('swara', 'Female'),
+    ('asad', 'Male'), ('uzma', 'Female'),
+    ('katja', 'Female'), ('conrad', 'Male'),
+    ('sunhi', 'Female'), ('injoon', 'Male'),
+    ('zariyah', 'Female'), ('hamed', 'Male'),
+]
+
+# Fallback Kokoro list, used only if the host GUI hasn't built self.kokoro_voices
+# yet.  Format matches that list ("id - Gender (desc)").
+_DUB_KOKORO_FALLBACK = [
+    'af_bella - Female (American, Warm)', 'af_heart - Female (American, Heartfelt)',
+    'af_nicole - Female (American, Soft)', 'am_adam - Male (American, Professional)',
+    'am_michael - Male (American, Energetic)', 'am_onyx - Male (American, Rich)',
+    'bf_emma - Female (British, Elegant)', 'bm_george - Male (British, Distinguished)',
+    'hf_alpha - Female (Hindi)',
+]
+
+
 def _styles():
     """Lazy import of the host GUI's shared UI classes.
 
@@ -297,6 +330,13 @@ class DubbingTabMixin:
                            'dub_multispeaker',
                            self._dub_multi_var.get())).pack(
                                anchor='w', padx=8, pady=(2, 2))
+        tk.Label(spk_card,
+                 text='   Each speaker can use a Gemini, Edge, Kokoro or Piper '
+                      'voice (prefixed in the dropdown). Kokoro/Piper are '
+                      'offline; Piper lists only downloaded voices.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), justify='left',
+                 wraplength=520).pack(anchor='w', padx=8, pady=(0, 2))
 
         # HF token (needed only if the local pyannote bundle is missing)
         hrow = tk.Frame(spk_card, bg=AppStyles.BG_CARD)
@@ -623,11 +663,64 @@ class DubbingTabMixin:
                                          padx=6)
 
     # ── Multi-speaker: detect + voice mapping ───────────────────────────
-    def _dub_voice_keys(self):
-        """Gemini TTS voice keys for the speaker dropdowns (safe fallback).
+    def _dub_extra_voices(self):
+        """(key, label, gender) for the non-Gemini engines: Edge, Kokoro, Piper.
 
-        The child-voice presets are appended so a speaker can be voiced as a
-        boy/girl (adult voice pitch-shifted up, or Edge's real child voice).
+        Keys are 'edge:<id>' / 'kokoro:<id>' / 'piper:<id>' so
+        dubbing_engine._resolve_voice_settings() can route each to the right
+        TTS engine.  Curated (see the module-level lists) to keep the
+        per-speaker dropdown usable.  Memoized on first call.
+        """
+        if getattr(self, '_dub_extra_cache', None) is not None:
+            return self._dub_extra_cache
+        out = []
+        # Edge (edge-tts, online) — curated multilingual set.
+        for vid, g in _DUB_EDGE_VOICES:
+            out.append((f'edge:{vid}', f'Edge · {vid} ({g})', g))
+        # Kokoro (local, offline) — reuse the 🗣 TTS tab's list when built.
+        kv = getattr(self, 'kokoro_voices', None) or _DUB_KOKORO_FALLBACK
+        for disp in kv:
+            vid = disp.split(' - ')[0].strip()
+            g = 'Female' if 'Female' in disp else ('Male' if 'Male' in disp else '')
+            out.append((f'kokoro:{vid}', f'Kokoro · {disp}', g))
+        # Piper (local) — only voices already downloaded (an undownloaded one
+        # would fail mid-dub).  Gender unknown → left blank.
+        try:
+            import piper_tts_helper
+            for vid in piper_tts_helper.get_downloaded_voices():
+                out.append((f'piper:{vid}', f'Piper · {vid}', ''))
+        except Exception:
+            pass
+        self._dub_extra_cache = out
+        return out
+
+    def _dub_extra_meta(self, key):
+        """(label, gender) for an extra-engine key, or None if it isn't one."""
+        for k, lbl, g in self._dub_extra_voices():
+            if k == key:
+                return lbl, g
+        return None
+
+    def _dub_voice_gender(self, key):
+        """'Male' / 'Female' / '' for any voice key (all engines)."""
+        meta = self._dub_extra_meta(key)
+        if meta:
+            return meta[1]
+        if str(key).startswith('Child '):
+            return ''
+        try:
+            from gemini_api_tts_helper import get_voice_gender
+            return get_voice_gender(key) or ''
+        except Exception:
+            return ''
+
+    def _dub_voice_keys(self):
+        """Voice keys for the speaker dropdowns: Gemini + child presets + the
+        non-Gemini engines (Edge / Kokoro / Piper).
+
+        Gemini keys stay bare (backward-compatible with saved mappings); the
+        child-voice presets let a speaker be a boy/girl; the extra engines are
+        appended so a speaker can be voiced by Edge, Kokoro or Piper too.
         """
         keys = None
         try:
@@ -643,15 +736,20 @@ class DubbingTabMixin:
         except Exception:
             child = ['Child girl (Gemini)', 'Child boy (Gemini)',
                      'Child girl (Edge)', 'Child boy (Edge)']
-        return list(keys) + child
+        extra = [k for (k, _lbl, _g) in self._dub_extra_voices()]
+        return list(keys) + child + extra
 
     def _dub_voice_label(self, key):
         """'Puck' → 'Puck (Male) — upbeat · ads/reactions' for display.
 
         Appends gender + a best-use hint so voices aren't picked blind.  Falls
         back to bare key if unknown.  Child presets already read naturally
-        (e.g. 'Child girl (Gemini)'), so they are shown as-is.
+        (e.g. 'Child girl (Gemini)'), so they are shown as-is.  Extra-engine
+        keys (Edge/Kokoro/Piper) carry their own pre-built label.
         """
+        meta = self._dub_extra_meta(key)
+        if meta:
+            return meta[0]
         if str(key).startswith('Child '):
             return str(key)
         try:
@@ -683,13 +781,9 @@ class DubbingTabMixin:
         self._dub_speaker_genders = genders
 
         # Group voice keys by gender so defaults can be gender-matched.
-        try:
-            from gemini_api_tts_helper import get_voice_gender
-        except Exception:
-            get_voice_gender = lambda k: ''
         by_gender = {'Male': [], 'Female': []}
         for k in voice_keys:
-            g = get_voice_gender(k)
+            g = self._dub_voice_gender(k)
             if g in by_gender:
                 by_gender[g].append(k)
 
