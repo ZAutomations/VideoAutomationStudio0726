@@ -26,11 +26,41 @@ Public API
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 SAMPLE_RATE = 44100
+
+# Windows STATUS_ACCESS_VIOLATION — the exit code a subprocess reports when it
+# segfaults.  faster-whisper/ctranslate2 crashes with this when it tries to run
+# on a GPU it can't actually use (e.g. the Maxwell Quadro M1200: ctranslate2
+# 4.x ships no compiled kernels for that old compute capability, so the CUDA
+# model-load dies at the C level — uncatchable from inside Python).  We detect
+# it in the PARENT and re-run the child with DUB_FORCE_CPU=1.
+_SEGV = 3221225477  # 0xC0000005
+
+# Once a GPU segfault is seen, remember it so we skip the (guaranteed-to-crash)
+# GPU attempt on every later call this session, and persist a per-machine
+# sentinel so future sessions go straight to CPU too.
+_gpu_segfaulted = False
+
+
+def _force_cpu_sentinel(venv_python: str | None) -> Path | None:
+    """Path to the per-machine 'GPU is unusable, force CPU' marker file.
+
+    Lives inside the (machine-local, gitignored) dub venv so it never travels
+    with the repo — a working-GPU PC that clones the repo starts fresh.
+    """
+    if not venv_python:
+        return None
+    try:
+        # venv_python = <venv>/Scripts/python.exe  →  <venv>/.dub_force_cpu
+        return Path(venv_python).resolve().parent.parent / '.dub_force_cpu'
+    except Exception:
+        return None
+
 
 
 def _noop_log(level, msg):
@@ -857,12 +887,35 @@ def transcribe_video(video_path: Path, settings: dict, log=None,
         log('info', 'Dub: diarization enabled — detecting speakers …')
 
     try:
+        global _gpu_segfaulted
+        run_env = None
+        sentinel = _force_cpu_sentinel(venv_python)
+        if _gpu_segfaulted or (sentinel and sentinel.exists()):
+            run_env = dict(os.environ, DUB_FORCE_CPU='1')
+
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=900 if diarize else 600)
+            timeout=900 if diarize else 600,
+            env=run_env)
+
+        if result.returncode == _SEGV and run_env is None:
+            # GPU segfault — remember it and retry on CPU.
+            _gpu_segfaulted = True
+            if sentinel:
+                try:
+                    sentinel.touch()
+                except Exception:
+                    pass
+            log('warn', 'Dub: whisper subprocess crashed (GPU/CUDA segfault) '
+                        '— retrying on CPU (DUB_FORCE_CPU=1)')
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=900 if diarize else 600,
+                env=dict(os.environ, DUB_FORCE_CPU='1'))
+
         if result.returncode != 0:
             log('error', f'Dub: whisper error (rc={result.returncode}): '
-                        f'{result.stderr[:200]}')
+                        f'{result.stderr[:300]}')
             return []
         word_timings = json.loads(result.stdout)
         if not isinstance(word_timings, list):
