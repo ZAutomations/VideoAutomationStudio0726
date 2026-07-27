@@ -94,13 +94,19 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
 
     # Auto-pick the best device/precision available.  GPU → float16 (fast,
     # accurate); CPU → int8 (low RAM, still usable on machines with no GPU).
+    # NOTE: old GPUs (Maxwell/Pascal, e.g. Quadro M1200) advertise CUDA but
+    # have poor fp16 support and little VRAM, so a cuda+float16 load can crash
+    # or OOM. We try GPU first, then fall back to CPU automatically (below).
     device, compute_type = "cpu", "int8"
-    try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            device, compute_type = "cuda", "float16"
-    except Exception:
-        pass
+    if os.environ.get("DUB_FORCE_CPU") == "1":
+        _log("[FASTER-WHISPER] DUB_FORCE_CPU=1 — using CPU (int8).")
+    else:
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                device, compute_type = "cuda", "float16"
+        except Exception:
+            pass
 
     # Prefer a bundled local model folder (offline / portable); otherwise
     # pass the size name so faster-whisper downloads + caches it once.
@@ -109,14 +115,42 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
     _src = f"local:{local}" if local else f"hub:{model_size}"
     _log(f"[FASTER-WHISPER] Loading model '{model_size}' from {_src} "
          f"(device={device}, compute_type={compute_type}) ...")
-    model = WhisperModel(model_ref, device=device, compute_type=compute_type)
+    try:
+        model = WhisperModel(model_ref, device=device, compute_type=compute_type)
+    except Exception as gpu_err:
+        if device == "cuda":
+            # Old/low-VRAM GPU (e.g. Quadro M1200) can't load the CUDA build —
+            # retry on CPU so dubbing still works instead of hard-failing.
+            _log(f"[FASTER-WHISPER] CUDA load failed ({gpu_err}); "
+                 f"falling back to CPU (int8).")
+            device, compute_type = "cpu", "int8"
+            model = WhisperModel(model_ref, device=device, compute_type=compute_type)
+        else:
+            raise
 
     _log(f"[FASTER-WHISPER] Transcribing: {audio_path}")
-    segments, _info = model.transcribe(
-        audio_path,
-        word_timestamps=True,
-        language=language,
-    )
+    try:
+        segments, _info = model.transcribe(
+            audio_path,
+            word_timestamps=True,
+            language=language,
+        )
+        # Force generator to run now so a GPU crash surfaces here (where we
+        # can still fall back), not later during iteration.
+        segments = list(segments)
+    except Exception as run_err:
+        if device == "cuda":
+            _log(f"[FASTER-WHISPER] CUDA transcribe failed ({run_err}); "
+                 f"reloading on CPU (int8).")
+            model = WhisperModel(model_ref, device="cpu", compute_type="int8")
+            segments, _info = model.transcribe(
+                audio_path,
+                word_timestamps=True,
+                language=language,
+            )
+            segments = list(segments)
+        else:
+            raise
 
     word_timings = []
     for segment in segments:
@@ -318,11 +352,19 @@ def _diarize_turns(audio_path: str, hf_token: str,
     if pipeline is None:
         return None
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    force_cpu = os.environ.get("DUB_FORCE_CPU") == "1"
+    use_cuda = torch.cuda.is_available() and not force_cpu
+    device = torch.device("cuda" if use_cuda else "cpu")
     try:
         pipeline.to(device)
     except Exception as e:
         _log(f"[DIARIZE] Could not move pipeline to {device}: {e} — using CPU")
+        device = torch.device("cpu")
+        use_cuda = False
+        try:
+            pipeline.to(device)
+        except Exception:
+            pass
 
     _log(f"[DIARIZE] Running diarization on {device} "
          f"(min_spk={min_spk}, max_spk={max_spk}) ...")
@@ -332,7 +374,21 @@ def _diarize_turns(audio_path: str, hf_token: str,
     if max_spk is not None:
         kwargs["max_speakers"] = max_spk
 
-    annotation = pipeline(audio_path, **kwargs)
+    try:
+        annotation = pipeline(audio_path, **kwargs)
+    except Exception as run_err:
+        if use_cuda:
+            # Old/low-VRAM GPU (e.g. Quadro M1200) crashes or OOMs mid-run.
+            # Move the pipeline to CPU and retry so speaker detection works.
+            _log(f"[DIARIZE] CUDA diarization failed ({run_err}); "
+                 f"retrying on CPU.")
+            try:
+                pipeline.to(torch.device("cpu"))
+            except Exception:
+                pass
+            annotation = pipeline(audio_path, **kwargs)
+        else:
+            raise
 
     turns = [
         (float(turn.start), float(turn.end), str(speaker))
