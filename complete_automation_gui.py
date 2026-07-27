@@ -360,6 +360,21 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
     def __init__(self, root):
         self.root = root
         self.root.title("Video Automation Studio - Professional Edition")
+        # App icon (taskbar / title bar / Alt-Tab). .ico is Windows-native;
+        # fall back to the PNG via iconphoto on other platforms.
+        try:
+            _icon_dir = os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), "assets")
+            _ico = os.path.join(_icon_dir, "app_icon.ico")
+            if os.path.isfile(_ico):
+                self.root.iconbitmap(_ico)
+            else:
+                _png = os.path.join(_icon_dir, "app_icon.png")
+                if os.path.isfile(_png):
+                    self._app_icon_img = tk.PhotoImage(file=_png)
+                    self.root.iconphoto(True, self._app_icon_img)
+        except Exception:
+            pass  # icon is cosmetic — never block startup on it
         self.root.geometry("1280x900")  # Larger default size
         self.root.configure(bg=AppStyles.BG_CARD)
         self.root.resizable(True, True)

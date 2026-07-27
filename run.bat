@@ -1,4 +1,5 @@
 @echo off
+title Video Automation Studio
 cd /d "%~dp0"
 if not exist ".venv\Scripts\activate.bat" (
     echo [ERROR] No venv. Run python -m venv .venv first.

@@ -87,6 +87,24 @@ echo ============================================
 echo  Setup complete!
 echo ============================================
 echo.
+
+echo Creating desktop shortcut...
+echo ----------------------------
+REM  Make sure the app icon exists (build it if this is a fresh clone), then
+REM  drop a "Video Automation Studio" shortcut on the Desktop + Start menu.
+if not exist "assets\app_icon.ico" (
+    if exist ".venv\Scripts\python.exe" (
+        .venv\Scripts\python.exe setup\make_icon.py
+    )
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0create_desktop_shortcut.ps1"
+if errorlevel 1 (
+    echo [WARN] Could not create the desktop shortcut automatically.
+    echo        Run setup\create_desktop_shortcut.bat later to retry.
+)
+echo.
+
 echo Launch the tool with:    run.bat
+echo (or the new "Video Automation Studio" icon on your Desktop)
 echo.
 pause
