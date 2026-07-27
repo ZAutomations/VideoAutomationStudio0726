@@ -92,41 +92,60 @@ def _extract_faster_whisper(audio_path: str, model_size: str, language: str):
     raises ImportError if the package isn't installed."""
     from faster_whisper import WhisperModel  # ImportError → caller falls back
 
-    # Auto-pick the best device/precision available.  GPU → float16 (fast,
-    # accurate); CPU → int8 (low RAM, still usable on machines with no GPU).
-    # NOTE: old GPUs (Maxwell/Pascal, e.g. Quadro M1200) advertise CUDA but
-    # have poor fp16 support and little VRAM, so a cuda+float16 load can crash
-    # or OOM. We try GPU first, then fall back to CPU automatically (below).
-    device, compute_type = "cpu", "int8"
-    if os.environ.get("DUB_FORCE_CPU") == "1":
+    # Build an ordered list of (device, compute_type) attempts. We want to
+    # KEEP old GPUs (Maxwell/Pascal, e.g. Quadro M1200) on the GPU — they run
+    # fine, they just can't do float16. So on CUDA we try, in order:
+    #   float16 (modern GPUs) → int8_float16 → int8_float32 → float32
+    # querying ctranslate2 for what the GPU actually supports, and only drop
+    # to CPU as the very last resort. This makes the M1200 GPU-accelerated
+    # instead of crawling on CPU.
+    attempts = []
+    force_cpu = os.environ.get("DUB_FORCE_CPU") == "1"
+    if force_cpu:
         _log("[FASTER-WHISPER] DUB_FORCE_CPU=1 — using CPU (int8).")
     else:
         try:
             import ctranslate2
             if ctranslate2.get_cuda_device_count() > 0:
-                device, compute_type = "cuda", "float16"
+                try:
+                    gpu_types = set(
+                        ctranslate2.get_supported_compute_types("cuda", 0))
+                except Exception:
+                    gpu_types = set()
+                # Preferred order; keep only those the GPU reports as supported
+                # (fall back to trying them all if the query returned nothing).
+                pref = ["float16", "int8_float16", "int8_float32", "float32"]
+                gpu_order = [t for t in pref if t in gpu_types] or pref
+                _log(f"[FASTER-WHISPER] GPU compute types available: "
+                     f"{sorted(gpu_types) or 'unknown'} → trying {gpu_order}")
+                for ct in gpu_order:
+                    attempts.append(("cuda", ct))
         except Exception:
             pass
+    # CPU last-resort (also the only entry when no GPU / forced CPU).
+    attempts.append(("cpu", "int8"))
 
     # Prefer a bundled local model folder (offline / portable); otherwise
     # pass the size name so faster-whisper downloads + caches it once.
     local = _resolve_local_model(model_size)
     model_ref = local or model_size
     _src = f"local:{local}" if local else f"hub:{model_size}"
-    _log(f"[FASTER-WHISPER] Loading model '{model_size}' from {_src} "
-         f"(device={device}, compute_type={compute_type}) ...")
-    try:
-        model = WhisperModel(model_ref, device=device, compute_type=compute_type)
-    except Exception as gpu_err:
-        if device == "cuda":
-            # Old/low-VRAM GPU (e.g. Quadro M1200) can't load the CUDA build —
-            # retry on CPU so dubbing still works instead of hard-failing.
-            _log(f"[FASTER-WHISPER] CUDA load failed ({gpu_err}); "
-                 f"falling back to CPU (int8).")
-            device, compute_type = "cpu", "int8"
-            model = WhisperModel(model_ref, device=device, compute_type=compute_type)
-        else:
-            raise
+
+    model = None
+    device, compute_type = attempts[-1]
+    for i, (dev, ct) in enumerate(attempts):
+        _log(f"[FASTER-WHISPER] Loading model '{model_size}' from {_src} "
+             f"(device={dev}, compute_type={ct}) ...")
+        try:
+            model = WhisperModel(model_ref, device=dev, compute_type=ct)
+            device, compute_type = dev, ct
+            break
+        except Exception as load_err:
+            last = (i == len(attempts) - 1)
+            if last:
+                raise
+            _log(f"[FASTER-WHISPER] {dev}/{ct} load failed ({load_err}); "
+                 f"trying next.")
 
     _log(f"[FASTER-WHISPER] Transcribing: {audio_path}")
     try:
