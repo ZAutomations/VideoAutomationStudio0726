@@ -238,6 +238,27 @@ class DubbingTabMixin:
                  bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
                  font=('Segoe UI', 8, 'italic')).pack(side='left', padx=(8, 0))
 
+        # Whisper model size — lets low-VRAM GPUs (e.g. Quadro M1200, 4GB)
+        # drop to 'base'/'small' while big GPUs use 'medium'/'large-v3'.
+        mrow = tk.Frame(src_card, bg=AppStyles.BG_CARD)
+        mrow.pack(fill='x', padx=8, pady=(0, 6))
+        tk.Label(mrow, text='Whisper model:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 9)).pack(side='left')
+        self._dub_whisper_model_var = tk.StringVar(
+            value=self.settings.get('dub_whisper_model', 'medium'))
+        model_combo = ttk.Combobox(
+            mrow, textvariable=self._dub_whisper_model_var,
+            values=['tiny', 'base', 'small', 'medium', 'large-v3'],
+            state='readonly', width=18)
+        model_combo.pack(side='left', padx=(6, 0))
+        model_combo.bind('<<ComboboxSelected>>', lambda e: self.update_setting(
+            'dub_whisper_model', self._dub_whisper_model_var.get()))
+        tk.Label(mrow,
+                 text='  Bigger = more accurate but needs more VRAM/time. '
+                      'Use "base"/"small" on old or 4GB GPUs.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic')).pack(side='left', padx=(8, 0))
+
         # ── 3) Target language ─────────────────────────────────────────
         lang_card = self._dub_card(scrollable, '🌐 Target Language')
         lrow = tk.Frame(lang_card, bg=AppStyles.BG_CARD)
