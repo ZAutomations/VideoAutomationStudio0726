@@ -2438,10 +2438,56 @@ class VideoEffects:
                             roi_mask[ry1 - roi_y1:ry2 - roi_y1, rx1 - roi_x1:rx2 - roi_x1] = 255
                     if np.any(roi_mask):
                         inpaint_radius = int(settings.get('inpaint_radius', 3))
-                        # Crop ROI, inpaint, paste back
-                        roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
-                        inpainted_roi = cv2.inpaint(roi_frame, roi_mask, inpaint_radius, cv2.INPAINT_TELEA)
-                        frame[roi_y1:roi_y2, roi_x1:roi_x2] = inpainted_roi
+                        roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+
+                        # ⚡ SPEED: cv2.inpaint (Telea) is an expensive iterative
+                        # fill and it was running on EVERY frame — the single
+                        # biggest cost of the inpaint feature (a 3-min clip =
+                        # ~5400 inpaint calls). But the region is a FIXED
+                        # rectangle and the video under a static logo/caption
+                        # usually changes slowly, so the fill is near-identical
+                        # frame-to-frame. We cache the fill and only re-run
+                        # inpaint when the pixels AROUND the mask actually drift
+                        # (cheap 16x16 signature compare), with a periodic
+                        # forced refresh so slow gradual motion never goes stale.
+                        # This is CPU-only in OpenCV, so caching is what makes it
+                        # fast on machines without a usable GPU; the encode side
+                        # still uses NVENC when a GPU is present.
+                        mbool = roi_mask.astype(bool)
+                        sig_key = (roi_x1, roi_y1, roi_x2, roi_y2,
+                                   int(inpaint_radius), int(np.count_nonzero(roi_mask)))
+                        sig_small = cv2.resize(roi_frame, (16, 16),
+                                               interpolation=cv2.INTER_AREA)
+                        cache = getattr(VideoEffects.apply_region_blur,
+                                        '_inpaint_cache', None)
+                        thr = float(settings.get('inpaint_cache_threshold', 6.0))
+                        max_skip = int(settings.get('inpaint_max_skip', 24))
+                        recompute = True
+                        if (cache is not None and cache.get('key') == sig_key
+                                and cache.get('sig') is not None
+                                and cache.get('skips', 0) < max_skip):
+                            drift = float(np.mean(np.abs(
+                                sig_small.astype(np.int16)
+                                - cache['sig'].astype(np.int16))))
+                            if drift <= thr:
+                                recompute = False
+                        if recompute:
+                            inpainted_roi = cv2.inpaint(
+                                roi_frame.copy(), roi_mask, inpaint_radius,
+                                cv2.INPAINT_TELEA)
+                            frame[roi_y1:roi_y2, roi_x1:roi_x2] = inpainted_roi
+                            VideoEffects.apply_region_blur._inpaint_cache = {
+                                'key': sig_key,
+                                'sig': sig_small,
+                                'fill': inpainted_roi[mbool].copy(),
+                                'skips': 0,
+                            }
+                        else:
+                            # Reuse the cached fill — write ONLY the masked
+                            # pixels so the live (unmasked) content stays current.
+                            roi_view = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                            roi_view[mbool] = cache['fill']
+                            cache['skips'] = cache.get('skips', 0) + 1
 
             # Add custom blur regions (for hiding specific logos/watermarks)
             custom_regions = settings.get('custom_blur_regions', [])
