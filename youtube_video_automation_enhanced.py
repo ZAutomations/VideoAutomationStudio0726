@@ -33,6 +33,10 @@ try:
 except ImportError:
     _piper_tts = None
 
+# ── Clipper-style ASS caption presets (ported from HarisClipper clipper-tool)
+import clipper_captions as _cc
+import caption_fonts as _cf
+
 # PERF: module-level caches for per-frame mask computations. The vignette,
 # spotlight, and other per-frame effects would otherwise re-allocate large
 # mask arrays (6MB+ each) for every single output frame. With these caches
@@ -5264,14 +5268,28 @@ class TTSGenerator:
                 print(f"  [WARNING] No word boundaries from TTS - using text splitting for word-level captions")
                 words = text.split()
                 if words:
-                    # Estimate word duration (total audio duration / number of words)
-                    # We'll calculate actual duration after file is created
                     for i, word in enumerate(words):
                         word_timings.append({
                             'word': word,
-                            'offset': i,  # Placeholder - will be calculated later
-                            'duration': 1  # Placeholder
+                            'offset': i,
+                            'duration': 1
                         })
+                # Refine placeholder timings to match actual audio duration
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        from moviepy import AudioFileClip as _AFC
+                    if output_path.exists() and output_path.stat().st_size > 0:
+                        _afc = _AFC(str(output_path))
+                        _adur = _afc.duration
+                        _afc.close()
+                        if _adur and _adur > 0:
+                            refine_word_timings_smart(word_timings, _adur, audio_path=output_path)
+                            print(f"  [SYNC] Refined {len(word_timings)} word timings to {_adur:.2f}s audio "
+                                  f"(character-weighted + VAD gap detection)")
+                except Exception as _ref_err:
+                    print(f"  [SYNC WARNING] Could not refine word timings: {_ref_err}")
 
             return True, word_timings
         except Exception as e:
@@ -6594,7 +6612,10 @@ class CaptionRenderer:
             words_per_caption = int(settings.get('caption_words_per_line', 3))
 
             # Calculate total words to show based on layout
-            if caption_layout == '1-line':
+            if words_per_caption <= 1:
+                # True one-word mode: show ONLY the active word, no surrounding context
+                context_words = 1
+            elif caption_layout == '1-line':
                 # 1-line layout: Show words_per_caption words on ONE line
                 context_words = words_per_caption
             else:
@@ -7731,7 +7752,10 @@ class CaptionRenderer:
         caption_clips = []
 
         # Calculate context words to display
-        if caption_layout == '1-line':
+        if words_per_caption <= 1:
+            # True one-word mode: show ONLY the active word, no surrounding context
+            context_words = 1
+        elif caption_layout == '1-line':
             context_words = words_per_caption
         elif caption_layout == 'multi-line':
             # Multi-line: Show more words (3-5 lines depending on words_per_caption)
@@ -11516,6 +11540,8 @@ class VideoQuoteAutomation:
         # Initialize it here so it always exists, even when the user has every
         # caption toggle off (the captions block at line ~7107 is gated).
         caption_clips = []
+        # Clipper-style ASS caption path (when clipper_captions_enabled is on)
+        _clipper_ass_path = None
 
         # Debug: Check caption and TTS settings
         print(f"DEBUG: enable_captions={self.settings.get('enable_captions', False)}, use_tts_voiceover={self.settings.get('use_tts_voiceover', False)}, TTS_AVAILABLE={TTS_AVAILABLE}")
@@ -11848,10 +11874,152 @@ class VideoQuoteAutomation:
         #   enable_captions          → Simple captions with style presets
         #   caption_highlight_enabled → CapCut-style word highlighting (TTS voiceover)
         #   caption_dialogue_enabled  → Original video dialogue captions (whisper)
-        if (self.settings.get('enable_captions', False)
+        #   clipper_captions_enabled  → ASS subtitle file + ffmpeg burn (port from clipper-tool)
+        _clipper_captions_on = self.settings.get('clipper_captions_enabled', False)
+
+        if _clipper_captions_on:
+            # ── Clipper-style ASS caption mode ──────────────────────────────
+            # Build an .ass subtitle file (hardware-accelerated via ffmpeg)
+            # instead of per-frame ImageClip compositing. This is MUCH faster
+            # and supports 18 professional presets + 5 animation modes.
+            try:
+                from pathlib import Path as _Path
+                import os as _os
+
+                _caption_text = voiceover_text or subtitle_text or ''
+                if not _caption_text.strip():
+                    print("[CLIPPER CAPTIONS] No text to caption — skipping.")
+                else:
+                    _preset_id = self.settings.get('clipper_caption_preset', 'bold_white')
+                    _animation = self.settings.get('clipper_caption_animation', 'none')
+
+                    # Build word list with timings
+                    _ass_words = []
+                    if word_timings and len(word_timings) > 0:
+                        # Use precise word timings from TTS/whisper
+                        for _wt in word_timings:
+                            _w = _wt.get('word', '') or ''
+                            if not _w.strip():
+                                continue
+                            _start = float(_wt.get('offset', 0))
+                            _dur = float(_wt.get('duration', 0.3))
+                            _ass_words.append({'word': _w, 'start': _start, 'end': _start + _dur})
+                    else:
+                        # No TTS word timings — try whisper on the voiceover audio first
+                        # for accurate word-boundary timestamps, then smart-refine.
+                        # This is MUCH better than the naive flat-estimation fallback.
+                        _whisper_fallback = False
+                        try:
+                            _whisper_audio = voiceover_file
+                            if not _whisper_audio or not Path(str(_whisper_audio)).exists():
+                                # tts_path might not be defined (e.g., pre-recorded voiceover path)
+                                try:
+                                    _whisper_audio = tts_path
+                                except NameError:
+                                    _whisper_audio = None
+                            if _whisper_audio and Path(str(_whisper_audio)).exists():
+                                print("[CLIPPER CAPTIONS] TTS word timings missing — running whisper on voiceover...")
+                                _wt_fallback = self._generate_word_timings_from_whisper(
+                                    video_path, Path(str(_whisper_audio))
+                                )
+                                if _wt_fallback and len(_wt_fallback) > 3:
+                                    # NOTE: Do NOT call refine_word_timings_smart here —
+                                    # it REPLACES accurate whisper word-level timestamps
+                                    # with character-weighted mathematical estimates (offset
+                                    # and duration are overwritten at lines 542-545), which
+                                    # destroys the frame-accurate sync that whisper provides.
+                                    # The CapCut per-frame path does NOT use smart-refine
+                                    # for this reason — it keeps raw whisper timestamps.
+                                    # Just use the raw whisper timings as-is, with a light
+                                    # scale pass so the last word ends at audio duration.
+                                    _est_dur = audio_duration or video.duration or 5.0
+                                    _last_end = max(
+                                        float(w.get('offset', 0)) + float(w.get('duration', 0.3))
+                                        for w in _wt_fallback
+                                    )
+                                    if _last_end > 0 and _est_dur > 0 and _last_end < _est_dur * 0.95:
+                                        _scale = _est_dur / _last_end
+                                        for _w in _wt_fallback:
+                                            _w['offset'] = float(_w.get('offset', 0)) * _scale
+                                            _w['duration'] = float(_w.get('duration', 0.3)) * _scale
+                                        print(f"  [SYNC] Scaled whisper timings by {_scale:.3f}x "
+                                              f"to match audio ({_last_end:.2f}s → {_est_dur:.2f}s)")
+                                    for _wt in _wt_fallback:
+                                        _w = (_wt.get('word', '') or '').strip()
+                                        if not _w:
+                                            continue
+                                        _start = float(_wt.get('offset', 0))
+                                        _dur = float(_wt.get('duration', 0.3))
+                                        _ass_words.append({'word': _w, 'start': _start, 'end': _start + _dur})
+                                    _whisper_fallback = True
+                                    print(f"[CLIPPER CAPTIONS] Whisper generated {len(_ass_words)} word timings")
+                        except Exception as _wf_err:
+                            print(f"[CLIPPER CAPTIONS] Whisper fallback failed: {_wf_err}")
+
+                        if not _whisper_fallback:
+                            # Last resort: estimate timing from audio duration
+                            _est_dur = audio_duration or video.duration or 5.0
+                            _est_words = _caption_text.split()
+                            if _est_words:
+                                _tpp = _est_dur / len(_est_words)
+                                for _i, _w in enumerate(_est_words):
+                                    _s = _i * _tpp
+                                    _ass_words.append({'word': _w, 'start': _s, 'end': _s + _tpp})
+
+                    if _ass_words:
+                        # Ensure fonts are available
+                        _cf.ensure_core_fonts()
+                        _ass_path = _Path(str(self.output_folder)) / f"_clipper_{video_index}.ass"
+
+                        # Merge global caption settings as overrides (position,
+                        # Y offset, font size scaling) so the user's Global
+                        # Settings sliders affect the ASS caption placement too.
+                        _cc_overrides = {}
+                        if _animation != 'none':
+                            _cc_overrides['animation'] = _animation
+                        # Position from Global Settings
+                        _gpos = self.settings.get('caption_position', 'bottom')
+                        _cc_overrides['position'] = _gpos
+                        # Font size scaling relative to preset default
+                        _user_fs = int(self.settings.get('caption_font_size', 60) or 60)
+                        _preset_fs = int(_cc.get_preset(_preset_id).get('font_size', 90))
+                        if _preset_fs > 0:
+                            _cc_overrides['font_scale'] = _user_fs / _preset_fs
+                        # Y offset -> pos_y percentage adjustment
+                        _yoff = int(self.settings.get('caption_y_offset', 0) or 0)
+                        if _yoff != 0:
+                            # Convert pixel offset (in 1920-high reference) to % of frame
+                            _cc_overrides['pos_y'] = 50.0 + (_yoff / 1920.0 * 100.0)
+
+                        _cc.build_ass(
+                            words=_ass_words,
+                            style_preset=_preset_id,
+                            video_w=video.w,
+                            video_h=video.h,
+                            out_path=_ass_path,
+                            clip_start=0.0,
+                            overrides=_cc_overrides if _cc_overrides else None,
+                        )
+                        _clipper_ass_path = str(_ass_path)
+                        print(f"[CLIPPER CAPTIONS] ASS file created: {_ass_path.name} "
+                              f"(preset={_preset_id}, anim={_animation}, {len(_ass_words)} words)")
+                    else:
+                        print("[CLIPPER CAPTIONS] No words could be generated — skipping.")
+            except Exception as _cc_err:
+                print(f"[WARNING] Clipper captions failed (falling back to no captions): {_cc_err}")
+                import traceback
+                traceback.print_exc()
+
+        elif (self.settings.get('enable_captions', False)
                 or self.settings.get('caption_highlight_enabled', False)
                 or self.settings.get('caption_dialogue_enabled', False)):
             try:
+                _e = self.settings.get('enable_captions', False)
+                _h = self.settings.get('caption_highlight_enabled', False)
+                _d = self.settings.get('caption_dialogue_enabled', False)
+                _wpc = self.settings.get('caption_words_per_line', 3)
+                print(f"[CAPTIONS] enable={_e}, highlight={_h}, dialogue={_d}, "
+                      f"words_per_caption={_wpc}, layout={self.settings.get('caption_layout', '2-line')}")
                 caption_clips_simple = []
                 caption_clips_highlight = []
 
@@ -11902,7 +12070,11 @@ class VideoQuoteAutomation:
                 # NOTE: Simple captions and CapCut highlighting are MUTUALLY EXCLUSIVE.
                 # When highlighting is enabled, only the highlighting path renders, so
                 # the two styles don't overlap on the same video frame.
-                if self.settings.get('enable_captions', False) and not self.settings.get('caption_highlight_enabled', False):
+                # NOTE: Clipper ASS captions are ALSO exclusive — when enabled, the
+                # per-frame caption styles are skipped to avoid double-captioning.
+                if (self.settings.get('enable_captions', False)
+                        and not self.settings.get('caption_highlight_enabled', False)
+                        and not _clipper_captions_on):
                     print(f"[CAPTIONS] Simple captions enabled (style presets)")
                     try:
                         # Determine audio duration for estimated timing
@@ -11930,7 +12102,8 @@ class VideoQuoteAutomation:
                         traceback.print_exc()
 
                 # --- STYLE 2: CapCut highlighted word captions (caption_highlight_enabled toggle) ---
-                if self.settings.get('caption_highlight_enabled', False):
+                # NOTE: Skipped when clipper ASS captions are active (double-captioning guard).
+                if self.settings.get('caption_highlight_enabled', False) and not _clipper_captions_on:
                     print(f"[CAPTIONS] CapCut highlighted captions enabled")
                     try:
                         if word_timings and len(word_timings) > 0:
@@ -11976,7 +12149,7 @@ class VideoQuoteAutomation:
                 # fall inside a TTS commentary/CTA window are suppressed so they don't
                 # collide with the voiceover captions/overlays from the script.
                 caption_clips_dialogue = []
-                if self.settings.get('caption_dialogue_enabled', False):
+                if self.settings.get('caption_dialogue_enabled', False) and not _clipper_captions_on:
                     print(f"[CAPTIONS] Dialogue captions enabled (whisper on original audio)")
                     try:
                         if video_path and Path(video_path).exists():
@@ -14542,6 +14715,49 @@ class VideoQuoteAutomation:
         final_video.close()
 
         print(f"[OK] Saved: {output_path.name}")
+
+        # ── Burn clipper-style ASS captions via ffmpeg (post-process) ─────
+        if _clipper_ass_path is not None:
+            try:
+                import subprocess as _sp
+                import shutil as _shutil
+                import os as _os
+
+                _tmp = output_path.with_suffix('.ass_burn_tmp.mp4')
+                _ass_path_obj = Path(_clipper_ass_path)
+                _ass_dir = _ass_path_obj.parent
+                _fonts_dir = _cf.get_fonts_dir()
+                _ass_rel = _ass_path_obj.name  # relative to cwd
+                # fonts_dir relative to ass_dir to avoid drive-colon issues
+                _fd_rel = _os.path.relpath(str(_fonts_dir), str(_ass_dir)).replace("\\", "/")
+
+                # ffmpeg: change to the ass file's directory so we can pass
+                # relative paths (avoids Windows drive-colon parsing in filter
+                # args). The input video path must be absolute.
+                _cmd = [
+                    'ffmpeg', '-y',
+                    '-i', str(output_path.resolve()),
+                    '-vf', f"ass={_ass_rel}:fontsdir={_fd_rel}",
+                    '-c:a', 'copy',
+                    '-preset', 'fast',
+                    '-crf', '23',
+                    '-pix_fmt', 'yuv420p',
+                    str(_tmp),
+                ]
+                print(f"[ASS BURN] Burning ASS captions via ffmpeg...")
+                _sp.run(_cmd, check=True, capture_output=True, timeout=600, cwd=str(_ass_dir))
+
+                # Swap temp → output
+                _shutil.move(str(_tmp), str(output_path))
+                print(f"[ASS BURN] ✓ Captions burned into {output_path.name}")
+            except Exception as _ass_err:
+                print(f"[WARNING] ASS caption burn failed (video saved without captions): {_ass_err}")
+                try:
+                    if _tmp.exists():
+                        _tmp.unlink()
+                except Exception:
+                    pass
+
         print(f"{'='*70}")
 
         return output_path, output_filename

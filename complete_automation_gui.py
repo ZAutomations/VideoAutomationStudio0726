@@ -5260,7 +5260,53 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             l.config(text=f"{'+' if int(v) >= 0 else ''}{int(v)}px")
         ))
 
-        # ────────────── 6. Live Log (right pane — built below) ──────────────
+        # ── 7. Caption Position ──
+        cap_pos_card = self.create_grid_card(cols[2], "📐 Caption Position", row=3, col=0)
+
+        # Position row: dropdown (top / center / bottom)
+        cpos_row = tk.Frame(cap_pos_card, bg=AppStyles.BG_CARD)
+        cpos_row.pack(fill='x', padx=4, pady=(1, 0))
+        tk.Label(cpos_row, text='Position:',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._os_cap_pos_var = tk.StringVar(
+            value=self.settings.get('caption_position', 'bottom'))
+        cpos_combo = ttk.Combobox(
+            cpos_row, textvariable=self._os_cap_pos_var,
+            values=['top', 'center', 'bottom'], state='readonly', width=8)
+        cpos_combo.pack(side='left', padx=(4, 0))
+        cpos_combo.bind('<<ComboboxSelected>>', lambda e: (
+            self.update_setting('caption_position', self._os_cap_pos_var.get()),
+            self._os_open_live_preview(),
+        ))
+
+        # Y-Offset row: slider (-200 to +200)
+        cyoff_row = tk.Frame(cap_pos_card, bg=AppStyles.BG_CARD)
+        cyoff_row.pack(fill='x', padx=4, pady=(0, 2))
+        tk.Label(cyoff_row, text='Y-Offset:',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._os_cap_yoff_var = tk.IntVar(
+            value=int(self.settings.get('caption_y_offset', 0)))
+        cyoff_scale = tk.Scale(
+            cyoff_row, from_=-200, to=200, orient='horizontal',
+            variable=self._os_cap_yoff_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+            sliderlength=12, length=60)
+        cyoff_scale.pack(side='left', fill='x', expand=True, padx=(4, 2))
+        cyoff_label = tk.Label(cyoff_row, text='0px',
+                              bg=AppStyles.BG_CARD, fg=AppStyles.ACCENT_PRIMARY,
+                              font=('Segoe UI', 8, 'bold'), width=5, anchor='w')
+        cyoff_label.pack(side='left')
+        def _on_cyoff(v):
+            iv = int(v)
+            self.update_setting('caption_y_offset', iv)
+            cyoff_label.config(text=f"{'+' if iv >= 0 else ''}{iv}px")
+            self._os_open_live_preview()
+        cyoff_scale.config(command=_on_cyoff)
+
+        # ── 8. Live Log (right pane — built below) ─────────────────
         # The log no longer lives at the bottom of the left scroll container;
         # it lives in the right pane so the user can see it while scrolling
         # the controls. The right pane is built AFTER the cards above so the
@@ -5968,24 +6014,22 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 bg_radius=int(self.settings.get('our_script_title_bg_radius', 12)))
 
         # ---- 4) Caption text ----
+        caption_text = ''
         if show_caption:
             try:
                 caption_text = self._os_resolve_caption_text(Path(channel), video_id)
             except Exception:
                 caption_text = ''
-            if self.settings.get('our_script_enabled', True) and caption_text.strip():
-                c_pos = self.settings.get('caption_position', 'bottom')
-                c_tc = self.settings.get('caption_text_color', '#FFFFFF')
-                c_bgc = self.settings.get('caption_bg_color', '#000000')
-                c_op = int(self.settings.get('caption_bg_opacity', 180))
-                c_bg_on = bool(self.settings.get('caption_bg_enabled', True))
-                c_fs = int(self.settings.get('caption_font_size', 60))
-                c_ff = self.settings.get('caption_font_family', 'Arial')
-                # When bg is disabled, draw with full opacity bg=transparent
-                alpha = max(0, min(255, int(c_op))) if c_bg_on else 0
-                self._os_draw_text_block(
-                    draw, pil_img, caption_text, c_pos, c_tc, c_bgc,
-                    alpha, c_fs, c_ff, draw_bg=c_bg_on)
+            if not caption_text.strip():
+                try:
+                    _os_txt = (self._os_text_widget.get('1.0', 'end-1c') or '').strip()
+                    if _os_txt:
+                        caption_text = _os_txt
+                except Exception:
+                    pass
+            # NOTE: The caption text is drawn on the RESIZED image below
+            # (after the resize step) so the font is at canvas resolution.
+            # Drawing it here (before resize) makes text ~1px after shrink.
 
         # ---- 4b) Bottom Text ----
         if show_bottom_text and self.settings.get('bottom_text_enabled', False):
@@ -6029,13 +6073,60 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             draw.rectangle([w - bp, 0, w - 1, h - 1], fill=bc)
 
         # ---- Fit into the inline canvas (no scroll, no popup) ----
-        # We already computed scale / new_w / new_h above so the text was
-        # drawn at the right size — just resize the whole image now.
         pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        # Draw caption text on the RESIZED image so it's at canvas resolution
+        # (not at 1080p → invisible after shrink). Uses only the first
+        # words_per_caption words so the preview matches what the final
+        # rendered captions will show (not the full text blob).
+        _cap_txt = caption_text.strip() if caption_text and caption_text.strip() else ''
+        if _cap_txt:
+            _wpc = max(1, int(self.settings.get('caption_words_per_line', 3)))
+            # Take only words_per_caption words for the preview sample
+            _cap_words = _cap_txt.split()
+            if len(_cap_words) > _wpc:
+                _cap_txt = ' '.join(_cap_words[:_wpc])
+            _cpos = self.settings.get('caption_position', 'bottom')
+            _cyoff = int(self.settings.get('caption_y_offset', 0))
+            _pil_scale = new_h / 1920.0 if new_h else 1.0
+            if _cpos == 'top':
+                _pil_y = int(new_h * 0.10) + int(_cyoff * _pil_scale)
+            elif _cpos == 'center':
+                _pil_y = new_h // 2 + int(_cyoff * _pil_scale)
+            else:
+                _pil_y = int(new_h * 0.78) + int(_cyoff * _pil_scale)
+            _pil_fs = max(10, int(60 * new_w / 240))
+            try:
+                _pil_font = ImageFont.truetype('arial.ttf', _pil_fs)
+            except Exception:
+                _pil_font = ImageFont.load_default()
+            _draw_resized = ImageDraw.Draw(pil_img, 'RGBA')
+            # Black pill background
+            _est_w = len(_cap_txt) * _pil_fs * 0.6
+            _px0 = new_w // 2 - int(_est_w) // 2 - 8
+            _py0 = _pil_y - _pil_fs // 2 - 6
+            _py1 = _pil_y + _pil_fs // 2 + 6
+            _px1 = new_w // 2 + int(_est_w) // 2 + 8
+            try:
+                _draw_resized.rounded_rectangle(
+                    [_px0, _py0, _px1, _py1], radius=6,
+                    fill=(0, 0, 0, 200))
+            except AttributeError:
+                _draw_resized.rectangle(
+                    [_px0, _py0, _px1, _py1],
+                    fill=(0, 0, 0, 200))
+            # White text — first words_per_caption words only
+            _draw_resized.text(
+                (new_w // 2, _pil_y), _cap_txt,
+                fill=(255, 255, 255, 255), font=_pil_font, anchor='mm')
+        # Convert to PhotoImage and display
         self._os_preview_tk_image = ImageTk.PhotoImage(pil_img)
         self._os_preview_canvas.delete('all')
         self._os_preview_canvas.create_image(
             cw // 2, ch // 2, image=self._os_preview_tk_image, anchor='center')
+        # Canvas overlay status bar (shows current position info)
+        self._os_preview_canvas.create_text(
+            6, ch-6, text=f'Y:{int(self.settings.get("caption_y_offset", 0)):+d} {self.settings.get("caption_position", "bottom")}',
+            fill='#ffd700', font=('Segoe UI', 6, 'bold'), anchor='sw', tags='cap_status')
         self._os_preview_last_video = cache_key
 
     @staticmethod
@@ -9454,6 +9545,11 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 self.settings.get('caption_highlight_enabled', False))
         print(f"[OURSCRIPT] caption_highlight_enabled = {self.settings['caption_highlight_enabled']} "
               f"(from checkbox={hasattr(self, 'caption_highlight_var')})")
+        print(f"[OURSCRIPT] enable_captions = {self.settings.get('enable_captions', False)}, "
+              f"words_per_caption = {self.settings.get('caption_words_per_line', 3)}, "
+              f"position = {self.settings.get('caption_position', 'bottom')}, "
+              f"y_offset = {self.settings.get('caption_y_offset', 0)}, "
+              f"layout = {self.settings.get('caption_layout', '2-line')}")
         # Original video dialogue captions (whisper-transcribed). Independent of
         # the TTS voiceover captions — captions the courtroom/source audio that
         # plays between commentary spots.
@@ -11812,6 +11908,105 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self.create_color_picker(stroke_card, 'Active Word Stroke Color:', 'caption_active_stroke_color', '#000000')
         self.create_color_picker(stroke_card, 'Inactive Words Stroke Color:', 'caption_inactive_stroke_color', '#000000')
         self.create_slider_control(stroke_card, 'Stroke Width:', 'caption_stroke_width', 1, 10, 2)
+
+        # ════════════════════════════════════════════════════════════════
+        # CLIPPER CAPTIONS (ASS Professional presets — port from clipper-tool)
+        # ════════════════════════════════════════════════════════════════
+        # Add at the bottom of the right column
+        _cc_row = self._next_grid_row(grid_container)
+        clipper_card = self.create_grid_card(grid_container, "🎬 Pro Captions (ASS)", row=_cc_row, col=2, colspan=2)
+
+        _cli_ena_var = tk.BooleanVar(value=self.settings.get('clipper_captions_enabled', False))
+        tk.Checkbutton(clipper_card, text='✅ Enable Pro ASS Captions (replaces per-frame)',
+                      variable=_cli_ena_var, bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                      font=('Segoe UI', 9, 'bold'),
+                      activebackground=AppStyles.BG_CARD,
+                      selectcolor=AppStyles.BG_INPUT,
+                      command=lambda: self._on_clipper_toggle(_cli_ena_var)).pack(anchor='w', padx=12, pady=6)
+
+        _info_f = tk.Frame(clipper_card, bg=AppStyles.BG_CARD)
+        _info_f.pack(fill='x', padx=12, pady=(0, 4))
+        tk.Label(_info_f, text='🎯 18 professional presets · 5 animation modes · ffmpeg hardware-accelerated',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 7, 'italic')).pack(anchor='w')
+
+        # Preset picker
+        _pf = tk.Frame(clipper_card, bg=AppStyles.BG_CARD)
+        _pf.pack(fill='x', padx=12, pady=4)
+        tk.Label(_pf, text='Style Preset:',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                font=('Segeo UI', 9)).pack(anchor='w', pady=(0, 2))
+
+        # Import clipper_captions to get presets
+        import clipper_captions as _cc_ui
+        _presets_data = _cc_ui.get_presets_for_gui()
+        _preset_ids = [p['id'] for p in _presets_data]
+        _preset_labels = [p['label'] for p in _presets_data]
+
+        self._clipper_preset_map = dict(zip(_preset_labels, _preset_ids))
+        _saved_id = self.settings.get('clipper_caption_preset', 'bold_white')
+        _saved_label = next((p['label'] for p in _presets_data if p['id'] == _saved_id), _presets_data[0]['label'])
+
+        self.clipper_preset_var = tk.StringVar(value=_saved_label)
+        _pc = ttk.Combobox(_pf, textvariable=self.clipper_preset_var,
+                           values=_preset_labels, state='readonly',
+                           font=('Segeo UI', 8), width=32)
+        _pc.pack(fill='x', pady=2)
+        _pc.bind('<<ComboboxSelected>>',
+                lambda e: self.update_setting('clipper_caption_preset',
+                    self._clipper_preset_map.get(self.clipper_preset_var.get(), 'bold_white')))
+
+        # Animation mode
+        _af = tk.Frame(clipper_card, bg=AppStyles.BG_CARD)
+        _af.pack(fill='x', padx=12, pady=4)
+        tk.Label(_af, text='Animation:',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                font=('Segeo UI', 9)).pack(anchor='w', pady=(0, 2))
+
+        _anim_opts = [
+            ('none', 'Static — all words shown'),
+            ('highlight', 'Highlight — active word glows (Hormozi/creator look)'),
+            ('word_reveal', 'Word Reveal — each word pops in as spoken'),
+            ('one_word', 'One Word — single word at a time, big impact'),
+            ('karaoke', 'Karaoke — words fill left-to-right'),
+        ]
+        self.clipper_anim_var = tk.StringVar(value=self.settings.get('clipper_caption_animation', 'none'))
+        _ac = ttk.Combobox(_af, textvariable=self.clipper_anim_var,
+                           values=[a[0] for a in _anim_opts], state='readonly',
+                           font=('Segeo UI', 8), width=32)
+        _ac.pack(fill='x', pady=2)
+        _ac.bind('<<ComboboxSelected>>',
+                lambda e: self.update_setting('clipper_caption_animation', self.clipper_anim_var.get()))
+
+        # Tooltip-style animation descriptions
+        _desc_f = tk.Frame(clipper_card, bg=AppStyles.BG_CARD)
+        _desc_f.pack(fill='x', padx=12, pady=(0, 4))
+        for _anim_id, _anim_desc in _anim_opts:
+            tk.Label(_desc_f,
+                    text=f'  ● {_anim_id}: {_anim_desc}',
+                    bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                    font=('Segeo UI', 7), anchor='w', justify='left'
+            ).pack(anchor='w')
+
+    def _next_grid_row(self, parent):
+        """Return the next available row index in a grid container."""
+        _max_row = -1
+        for _child in parent.winfo_children():
+            _info = _child.grid_info()
+            if _info and 'row' in _info:
+                _max_row = max(_max_row, int(_info['row']))
+        return _max_row + 1
+
+    def _on_clipper_toggle(self, var):
+        """Handle clipper captions toggle — update setting and disable conflicting modes."""
+        _enabled = var.get()
+        self.settings['clipper_captions_enabled'] = _enabled
+        # When clipper captions are ON, disable the per-frame caption modes to avoid double-captioning
+        if _enabled:
+            self.settings['enable_captions'] = False
+            self.settings['caption_highlight_enabled'] = False
+        self.save_settings(show_popup=False)
+        self.update_caption_preview()
 
     def _inline_duration(self, parent, setting_key, default, lo=0.1, hi=10.0, length=110):
         """Compact horizontal duration slider with showvalue."""
@@ -17682,6 +17877,122 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         canvas.create_text(canvas_w//2, 8, text='TOP', fill='#555', font=('Segoe UI', 7))
         canvas.create_text(canvas_w//2, canvas_h//2, text='CENTER', fill='#555', font=('Segoe UI', 7))
         canvas.create_text(canvas_w//2, canvas_h-8, text='BOTTOM', fill='#555', font=('Segoe UI', 7))
+
+        # ════════════════════════════════════════════════════════════════════
+        # CLIPPER ASS CAPTIONS PREVIEW
+        # ════════════════════════════════════════════════════════════════════
+        if self.settings.get('clipper_captions_enabled', False):
+            try:
+                import clipper_captions as _cc_pv
+
+                _preset_id = self.settings.get('clipper_caption_preset', 'bold_white')
+                _preset = _cc_pv.get_preset(_preset_id)
+                _animation = self.settings.get('clipper_caption_animation', 'none')
+
+                # Scale font to preview size
+                _scale = canvas_w / 720.0
+                _psize = max(10, int(_preset.get('font_size', 90) * _scale * 0.6))
+
+                # Colours from preset
+                _primary = _preset.get('primary_color', '#FFFFFF')
+                _highlight = _preset.get('highlight_color', '#FFD400')
+                _outline_col = _preset.get('outline_color', '#000000')
+                _font_fam = _preset.get('font_family', 'Roboto')
+                _pos = _preset.get('position', 'bottom')
+                _bold = _preset.get('bold', True)
+                _uppercase = _preset.get('uppercase', True)
+                _bg_on = _preset.get('background_enabled', False)
+
+                # Determine Y position — prefer Global Settings over preset position
+                _gpos = self.settings.get('caption_position', 'bottom')
+                _gpos = _gpos if _gpos in ('top', 'center', 'bottom') else _pos
+                _yoff = int(self.settings.get('caption_y_offset', 0) or 0)
+                if _gpos == 'top':
+                    _py = int(canvas_h * 0.10) + int(_yoff * _scale * 0.05)
+                elif _gpos == 'center':
+                    _py = canvas_h // 2 + int(_yoff * _scale * 0.05)
+                else:
+                    _py = int(canvas_h * 0.78) + int(_yoff * _scale * 0.05)
+
+                # Font size — blend preset value with global setting
+                _user_fs = int(self.settings.get('caption_font_size', 60) or 60)
+                _preset_fs = _preset.get('font_size', 90)
+                _blend_fs = int((_user_fs + _preset_fs) / 2)
+                _psize = max(10, int(_blend_fs * _scale * 0.6))
+
+                # Sample text based on animation type
+                if _animation == 'one_word':
+                    _sample = 'SKILLS'
+                elif _animation == 'word_reveal' or _animation == 'highlight':
+                    _sample = 'Your Skills Are Your Superpower'
+                else:
+                    _sample = 'YOUR SKILLS ARE YOUR SUPERPOWER'
+
+                if _uppercase:
+                    _sample = _sample.upper()
+
+                # Font weight fallback for tkinter
+                _tk_font = _font_fam
+                if _bold:
+                    _tk_font = (_font_fam, _psize, 'bold')
+                else:
+                    _tk_font = (_font_fam, _psize, 'normal')
+
+                # Background box
+                if _bg_on:
+                    _bg_col = _preset.get('background_color', '#000000')
+                    # Estimate text bbox and draw a box behind it
+                    _est_w = len(_sample) * _psize * 0.55
+                    _bx0 = (canvas_w - _est_w) // 2 - 8
+                    _bx1 = (canvas_w + _est_w) // 2 + 8
+                    _by0 = _py - _psize // 2 - 4
+                    _by1 = _py + _psize // 2 + 4
+                    canvas.create_rectangle(_bx0, _by0, _bx1, _by1,
+                                           fill=_bg_col, outline='')
+
+                # Outline (stroke) — draw text offset in 8 directions
+                _outline_w = _preset.get('outline', 5)
+                if _outline_w > 0:
+                    _steps = [(-1,-1),(-1,1),(1,-1),(1,1),(-1,0),(1,0),(0,-1),(0,1)]
+                    for _dx, _dy in _steps:
+                        canvas.create_text(
+                            canvas_w//2 + _dx, _py + _dy,
+                            text=_sample, fill=_outline_col,
+                            font=_tk_font, anchor='center')
+
+                # Main text — use highlight color as active word color
+                # For highlight animation, draw the whole phrase with the
+                # primary colour and one word in highlight colour.
+                if _animation == 'highlight':
+                    _words = _sample.split()
+                    _total_est = sum(len(w) * _psize * 0.55 for w in _words)
+                    _x = (canvas_w - _total_est) / 2
+                    for _wi, _w in enumerate(_words):
+                        _col = _highlight if _wi == len(_words)//2 else _primary
+                        canvas.create_text(_x, _py, text=_w,
+                                         font=_tk_font, fill=_col, anchor='w')
+                        _x += len(_w) * _psize * 0.6
+                else:
+                    canvas.create_text(canvas_w//2, _py, text=_sample,
+                                     font=_tk_font, fill=_primary, anchor='center')
+
+                # Metadata label at the bottom
+                _meta = f'ASS · {_preset.get("label", _preset_id)} · {_animation}'
+                canvas.create_text(canvas_w//2, canvas_h-4,
+                                 text=_meta,
+                                 fill='#888', font=('Segoe UI', 7, 'italic'),
+                                 anchor='s')
+
+                # Position + font info
+                canvas.create_text(canvas_w//2, canvas_h-16,
+                                 text=f'Font: {_font_fam} · Position: {_gpos} · Size: {_user_fs}px',
+                                 fill='#666', font=('Segoe UI', 6),
+                                 anchor='s')
+
+                return  # skip the legacy preview below
+            except Exception as _pv_err:
+                print(f"[PREVIEW] Clipper preview error: {_pv_err}")
+                # fall through to legacy preview
 
         # Get current settings
         position = self.settings.get('caption_position', 'bottom')
