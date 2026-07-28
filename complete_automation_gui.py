@@ -2308,8 +2308,20 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                         x2 = int(w * (x + width) / 100)
                         y2 = int(h * (y + height) / 100)
 
-                    # Draw blur region outline
-                    draw.rectangle([x1, y1, x2, y2], outline='#ff0000', width=3)
+                    # Determine mode for visual style
+                    region_mode = region.get('mode', 'blur')
+                    is_inpaint = region_mode == 'inpaint'
+                    border_color = '#22c55e' if is_inpaint else '#ff0000'
+                    label_tag = ' [AI Remove]' if is_inpaint else ''
+
+                    # Draw blur/inpaint region outline
+                    draw.rectangle([x1, y1, x2, y2], outline=border_color, width=3)
+                    if is_inpaint:
+                        # Semi-transparent green fill for inpaint areas
+                        try:
+                            draw.rectangle([x1, y1, x2, y2], fill=(34, 197, 94, 30))
+                        except Exception:
+                            pass
 
                     # Draw region label
                     region_name = region.get('name', 'Region')
@@ -2318,8 +2330,8 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     except:
                         label_font = ImageFont.load_default()
 
-                    draw.text((x1 + 5, y1 + 5), region_name,
-                             fill='#ff0000', font=label_font)
+                    draw.text((x1 + 5, y1 + 5), f'{region_name}{label_tag}',
+                             fill=border_color, font=label_font)
 
                     # Draw text overlay if defined
                     if text_content:
@@ -3672,11 +3684,47 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             y_spinbox = tk.Spinbox(controls_frame, from_=0, to=100, textvariable=y_var, width=6, **spinbox_style)
             y_spinbox.grid(row=0, column=3, padx=(0, 8), pady=3)
 
-            # Blur intensity (moved to first row for prominence)
-            tk.Label(controls_frame, text='Blur:', **label_style).grid(row=0, column=4, sticky='w', padx=2, pady=3)
+            # Mode selector (Blur vs Inpaint/AI Remove)
+            mode_var = tk.StringVar(value=region.get('mode', 'blur'))
+            
+            def make_mode_callback(index, var):
+                def callback(*args):
+                    self.update_custom_blur_region(index, 'mode', var.get())
+                    # Toggle blur intensity label based on mode
+                    try:
+                        if var.get() == 'inpaint':
+                            mode_label.config(text='Radius:')
+                        else:
+                            mode_label.config(text='Blur:')
+                    except:
+                        pass
+                return callback
+
+            mode_label = tk.Label(controls_frame, text='Inpaint' if region.get('mode', 'blur') == 'inpaint' else 'Blur:', **label_style)
+            mode_label.grid(row=0, column=4, sticky='w', padx=2, pady=3)
+            
+            mode_selector = ttk.Combobox(controls_frame, textvariable=mode_var,
+                                         values=['blur', 'inpaint'], state='readonly', width=7)
+            mode_selector.grid(row=0, column=5, padx=(0, 3), pady=3)
+            mode_selector.bind('<<ComboboxSelected>>', make_mode_callback(idx, mode_var))
+
+            # Intensity/Radius (reused for inpaint radius)
             intensity_var = tk.IntVar(value=region.get('intensity', 25))
-            intensity_spinbox = tk.Spinbox(controls_frame, from_=1, to=100, textvariable=intensity_var, width=6, **spinbox_style)
-            intensity_spinbox.grid(row=0, column=5, padx=(0, 5), pady=3)
+            intensity_spinbox = tk.Spinbox(controls_frame, from_=1, to=100, textvariable=intensity_var, width=5, **spinbox_style)
+            intensity_spinbox.grid(row=0, column=6, padx=(0, 3), pady=3)
+            # Show % for blur, px for inpaint
+            intensity_suffix = tk.Label(controls_frame, text='%' if region.get('mode', 'blur') != 'inpaint' else 'px',
+                                        bg='#2d3748', fg='#718096', font=('Segoe UI', 7))
+            intensity_suffix.grid(row=0, column=7, sticky='w', padx=0)
+
+            def make_intensity_suffix_updater(var, suffix_label):
+                def callback(*args):
+                    if var.get() == 'inpaint':
+                        suffix_label.config(text='px')
+                    else:
+                        suffix_label.config(text='%')
+                return callback
+            mode_var.trace('w', make_intensity_suffix_updater(mode_var, intensity_suffix))
 
             # Width
             tk.Label(controls_frame, text='W:', **label_style).grid(row=1, column=0, sticky='w', padx=(5, 2), pady=3)
@@ -3691,8 +3739,8 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             h_spinbox.grid(row=1, column=3, padx=(0, 8), pady=3)
 
             # Add percentage labels
-            tk.Label(controls_frame, text='%', bg='#2d3748', fg='#718096', font=('Segoe UI', 7)).grid(row=0, column=6, sticky='w', padx=0)
-            tk.Label(controls_frame, text='(all values in %)', bg='#2d3748', fg='#718096', font=('Segoe UI', 7, 'italic')).grid(row=1, column=4, columnspan=3, sticky='w', padx=2)
+            tk.Label(controls_frame, text='%', bg='#2d3748', fg='#718096', font=('Segoe UI', 7)).grid(row=1, column=4, sticky='w', padx=0)
+            tk.Label(controls_frame, text='(all values in %)', bg='#2d3748', fg='#718096', font=('Segoe UI', 7, 'italic')).grid(row=1, column=5, columnspan=3, sticky='w', padx=2)
 
             # Text overlay section (optional - to replace logo with text)
             text_section = tk.Frame(region_frame, bg='#2d3748')
@@ -3864,14 +3912,16 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             w_var.trace('w', make_update_callback(idx, 'width', w_var))
             h_var.trace('w', make_update_callback(idx, 'height', h_var))
             intensity_var.trace('w', make_update_callback(idx, 'intensity', intensity_var))
+            mode_var.trace('w', make_update_callback(idx, 'mode', mode_var))
 
         # Professional help section with better visibility
         help_frame = tk.Frame(custom_blur_card, bg='#1e2936', relief='solid', borderwidth=1)
         help_frame.pack(fill='x', padx=15, pady=(10, 5))
-        tk.Label(help_frame, text='💡 Tip: Enable a region and adjust X, Y, Width, Height to position the blur box. All values are percentages (0-100%).',
+        tk.Label(help_frame, text='💡 Tip: Enable a region and adjust X, Y, Width, Height to position the box. All values are percentages (0-100%).\n'
+                                  '   Mode: "Blur" hides content with Gaussian blur. "Inpaint" uses AI to remove objects/captions by filling in surrounding pixels.',
                 bg='#1e2936', fg='#90cdf4',
                 font=('Segoe UI', 8, 'italic'),
-                wraplength=400, justify='left').pack(padx=10, pady=8)
+                wraplength=500, justify='left').pack(padx=10, pady=8)
 
     def create_our_script_tab(self):
         """Create the OurScript tab — channel-aware single-video pipeline.
@@ -3907,19 +3957,21 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                                 bg=AppStyles.BG_CARD, borderwidth=0)
         vsplit.pack(fill='both', expand=True, padx=4, pady=4)
 
-        # ─── LEFT: scrollable controls ────────────────────────────────
+        # ─── LEFT: scrollable controls (vertical + horizontal scroll) ──
         left_holder = tk.Frame(vsplit, bg=AppStyles.BG_CARD)
         vsplit.add(left_holder, minsize=620, stretch='always')
 
         canvas = tk.Canvas(left_holder, bg=AppStyles.BG_CARD, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(left_holder, orient='vertical', command=canvas.yview)
+        v_scrollbar = ttk.Scrollbar(left_holder, orient='vertical', command=canvas.yview)
+        h_scrollbar = ttk.Scrollbar(left_holder, orient='horizontal', command=canvas.xview)
         content = tk.Frame(canvas, bg=AppStyles.BG_CARD)
         content.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.create_window((0, 0), window=content, anchor='nw')
-        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
         canvas.pack(side='left', fill='both', expand=True)
-        scrollbar.pack(side='right', fill='y')
-        self.setup_mousewheel_scroll(canvas, content)
+        v_scrollbar.pack(side='right', fill='y')
+        h_scrollbar.pack(side='bottom', fill='x')
+        self.setup_mousewheel_scroll(canvas, content, enable_horizontal=True)
 
         # 3 equal-width columns, each an independent grid — card heights don't sync
         main_grid = tk.Frame(content, bg=AppStyles.BG_CARD)
@@ -4664,6 +4716,10 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     bg_color='#d69e2e', font=('Segoe UI', 8, 'bold'),
                     padx=4, pady=1,
                     command=lambda: self._os_bb_add_middle_region(cb_c, cb_stat)).pack(side='left', padx=(0, 2))
+        ModernButton(btn_r, text='Inpaint ▼',
+                    bg_color='#22c55e', font=('Segoe UI', 8, 'bold'),
+                    padx=4, pady=1,
+                    command=lambda: self._os_bb_add_inpaint_region(cb_c, cb_stat)).pack(side='left', padx=(0, 2))
         ModernButton(btn_r, text='Ref',
                     bg_color=AppStyles.ACCENT_INFO, font=('Segoe UI', 7),
                     padx=4, pady=1,
@@ -4691,6 +4747,26 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                         length=35, sliderlength=8,
                         font=('Segoe UI', 5)).pack(fill='x')
                 var.trace_add('write', lambda *_,k=key,v=var: self._os_bb_update_middle_region(k, v.get()))
+
+        # ── Mode selector: Blur / Inpaint ──
+        mode_row = tk.Frame(cb_c, bg=AppStyles.BG_CARD)
+        mode_row.pack(fill='x', padx=2, pady=(1, 0))
+        tk.Label(mode_row, text='Mode:',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._os_cb_mode_var = tk.StringVar(value='blur')
+        mode_combo = ttk.Combobox(mode_row, textvariable=self._os_cb_mode_var,
+                                  values=['blur', 'inpaint'], state='readonly', width=8)
+        mode_combo.pack(side='left', padx=(2, 0))
+        def _on_cb_mode_change(*_):
+            mode = self._os_cb_mode_var.get()
+            self._os_bb_update_middle_region('mode', mode)
+            self._os_open_live_preview()
+        mode_combo.bind('<<ComboboxSelected>>', lambda e: _on_cb_mode_change())
+        # Hint text
+        tk.Label(mode_row, text='Blur=hide  Inpaint=AI remove',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 5, 'italic')).pack(side='right')
 
         # Fill Color
         fc_row = tk.Frame(cb_c, bg=AppStyles.BG_CARD)
@@ -5838,6 +5914,11 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     except AttributeError:
                         draw.rectangle([x1, y1, x2, y2],
                                        fill=cc + (ca,), outline='#ef4444', width=2)
+                elif region.get('mode', 'blur') == 'inpaint':
+                    # Inpaint mode: green border with "AI Remove" indicator
+                    draw.rectangle([x1, y1, x2, y2], outline='#22c55e', width=4)
+                    # Semi-transparent green fill
+                    draw.rectangle([x1, y1, x2, y2], fill=(34, 197, 94, 40))
                 else:
                     # Blur mode: actually blur the region + fill overlay (frosted glass)
                     from PIL import ImageFilter as _IF
@@ -5862,7 +5943,9 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     except Exception:
                         draw.rectangle([x1, y1, x2, y2], outline='#ef4444', width=4)
                 name = region.get('name', 'Region')
-                draw.text((x1 + 6, y1 + 6), name, fill='#ef4444', font=label_font)
+                mode_tag = ' [AI Remove]' if region.get('mode', 'blur') == 'inpaint' else ''
+                tag_color = '#22c55e' if region.get('mode', 'blur') == 'inpaint' else '#ef4444'
+                draw.text((x1 + 6, y1 + 6), f'{name}{mode_tag}', fill=tag_color, font=label_font)
 
         # ---- 3) Title text ----
         if self.settings.get('our_script_title_auto_fetch', False):
@@ -6090,6 +6173,37 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self._os_bb_rebuild_cb_list(parent, status_label)
         self._os_open_live_preview()
     
+
+    def _os_bb_add_inpaint_region(self, parent, status_label):
+        """Add a preset inpaint region for removing bottom captions."""
+        regions = self.settings.get('custom_blur_regions', []) or []
+        clean = {
+            'x': 0, 'y': 82, 'width': 100, 'height': 18,
+            'intensity': 3, 'enabled': True, 'mode': 'inpaint',
+            'fill_color': '', 'fill_opacity': 0,
+            'cover_mode': False, 'cover_radius': 8,
+        }
+        replaced = False
+        for region in regions:
+            if isinstance(region, dict) and region.get('enabled', False):
+                if region.get('mode', 'blur') == 'inpaint':
+                    region.update(clean)
+                    replaced = True
+                    break
+        if not replaced:
+            regions.append(clean.copy())
+        self.update_setting('custom_blur_regions', regions)
+        if hasattr(self, '_os_cb_mode_var'):
+            self._os_cb_mode_var.set('inpaint')
+        if hasattr(self, '_os_cb_x_var'):
+            self._os_cb_x_var.set(0)
+            self._os_cb_y_var.set(82)
+            self._os_cb_w_var.set(100)
+            self._os_cb_h_var.set(18)
+        if hasattr(self, '_os_cb_cover_mode_var'):
+            self._os_cb_cover_mode_var.set(False)
+        self._os_bb_rebuild_cb_list(parent, status_label)
+        self._os_open_live_preview()
 
     def _os_bb_update_middle_region(self, key, value):
         """Update a property on the first enabled custom blur region."""
@@ -6556,6 +6670,17 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                             self._os_bb_rebuild_cb_list(cb_col, cb_stat),
                             self._os_open_live_preview())).pack(side='right')
         cb_stat.config(text=f'{enabled_count} of {len(custom_regions)} enabled')
+        # Sync mode selector with first enabled region
+        for region in custom_regions:
+            if isinstance(region, dict) and region.get('enabled', False):
+                if hasattr(self, '_os_cb_mode_var'):
+                    self._os_cb_mode_var.set(region.get('mode', 'blur'))
+                if hasattr(self, '_os_cb_x_var'):
+                    self._os_cb_x_var.set(region.get('x', 0))
+                    self._os_cb_y_var.set(region.get('y', 0))
+                    self._os_cb_w_var.set(region.get('width', 100))
+                    self._os_cb_h_var.set(region.get('height', 10))
+                break
 
     def _os_bb_toggle_custom_region(self, idx, enabled):
         custom_regions = self.settings.get('custom_blur_regions', []) or []
@@ -12421,11 +12546,14 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
 
     # Helper methods
 
-    def setup_mousewheel_scroll(self, canvas, content):
+    def setup_mousewheel_scroll(self, canvas, content, enable_horizontal=False):
         """Setup mouse wheel scrolling for a canvas (Windows compatible)"""
         def _on_mousewheel(event):
-            # Windows mouse wheel
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # Windows mouse wheel: vertical by default, horizontal with Shift
+            if enable_horizontal and (event.state & 0x0001):  # Shift key pressed
+                canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         def _bind_mousewheel(event):
             canvas.bind_all("<MouseWheel>", _on_mousewheel)

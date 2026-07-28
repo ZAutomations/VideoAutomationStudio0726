@@ -428,14 +428,15 @@ class FFMpegRenderer:
             )
             current_label = f'v_ov{idx}'
 
-        # 8. Region blur (watermark hiding)
+        # 8. Region blur / inpaint (watermark/logo/caption removal)
         if s.get('region_blur_enabled', False) or any(
             r.get('enabled', False)
             for r in s.get('custom_blur_regions', [])
         ):
-            blur_f = self._build_region_blur_filter(current_label, s, inputs.target_w, inputs.target_h)
-            if blur_f:
-                filters.append(blur_f)
+            blur_filters = self._build_region_blur_filters(current_label, s, inputs.target_w, inputs.target_h)
+            for bf in blur_filters:
+                filters.append(bf)
+            if blur_filters:
                 current_label = 'v_blur'
 
         # 9. Video zoom (Ken Burns effect)
@@ -543,37 +544,80 @@ class FFMpegRenderer:
 
         return filters, current
 
-    def _build_region_blur_filter(self, label: str, settings: dict,
-                                   w: int, h: int) -> str:
-        """Build region blur for watermark/logo hiding."""
-        parts = [f'[{label}]']
+    def _build_region_blur_filters(self, label: str, settings: dict,
+                                    w: int, h: int) -> list:
+        """Build list of filter strings for region blur / inpaint.
+        
+        Returns a list of FFmpeg filter_complex strings to be appended
+        to the main filters list. Each entry chains from the previous label.
+        The last output label is always 'v_blur'.
+        """
+        result = []
+        current = label
+
+        def pct_to_px(val, dim):
+            if isinstance(val, str) and '%' in str(val):
+                return int(dim * float(str(val).rstrip('%')) / 100)
+            if isinstance(val, (int, float)) and 0 <= val <= 100:
+                return int(dim * val / 100)
+            return int(val)
 
         blur_regions = settings.get('custom_blur_regions', [])
-        if blur_regions:
-            for r in blur_regions:
-                if not r.get('enabled', False):
-                    continue
-                x = r.get('x', 0)
-                y = r.get('y', 0)
-                bw = r.get('width', 100)
-                bh = r.get('height', 100)
-                parts.append(
-                    f'boxblur={bw}:{bh}:enable=\'between(t,{r.get("start_time", 0)},{r.get("end_time", 9999)})\''
+
+        # Process custom regions in order
+        region_idx = 0
+        for r in blur_regions:
+            if not r.get('enabled', False):
+                continue
+            mode = r.get('mode', 'blur')
+            px = pct_to_px(r.get('x', 0), w)
+            py = pct_to_px(r.get('y', 0), h)
+            pw = pct_to_px(r.get('width', 100), w)
+            ph = pct_to_px(r.get('height', 100), h)
+
+            if pw <= 2 or ph <= 2:
+                continue
+
+            enable_expr = f'between(t,{r.get("start_time", 0)},{r.get("end_time", 9999)})'
+            out_label = f'v_br{region_idx}'
+            region_idx += 1
+
+            if mode == 'inpaint':
+                result.append(
+                    f'[{current}]delogo=x={px}:y={py}:w={pw}:h={ph}:enable=\'{enable_expr}\'[{out_label}]'
                 )
+            else:
+                # boxblur requires odd kernel size
+                kernel = int(r.get('intensity', 15)) * 2 + 1
+                result.append(
+                    f'[{current}]boxblur={kernel}:enable=\'{enable_expr}\'[{out_label}]'
+                )
+            current = out_label
 
-        if len(parts) > 1:
-            chain = ','.join(parts[1:])
-            return f'[{label}]{chain}[v_blur]'
-
-        # Simple region blur (center-based percentage)
+        # Predefined region blur (simple bottom/top/etc)
         if settings.get('region_blur_enabled', False):
-            blur_strength = settings.get('region_blur_strength', 20)
-            region = settings.get('blur_region', 'bottom')
-            if region == 'bottom':
-                parts.append(f'crop=iw:ih*0.15:0:ih*0.85,boxblur={blur_strength},{_overlay_back}')
-            # TODO: More region options
+            blur_region = settings.get('blur_region', 'bottom')
+            blur_size = int(settings.get('blur_region_size', 20))
+            bpct = blur_size / 100.0
+            kernel = int(settings.get('blur_intensity', 15)) * 2 + 1
+            if blur_region == 'bottom':
+                crop_h = int(h * bpct)
+                result.append(
+                    f'[{current}]crop=iw:{crop_h}:0:{h - crop_h},boxblur={kernel}[v_blur]'
+                )
+            else:
+                # Fallback: no-op
+                result.append(f'[{current}]null[v_blur]')
 
-        return ''
+        if not result:
+            return []
+
+        # Ensure last label is v_blur
+        if result and not result[-1].endswith('[v_blur]'):
+            last_out = f'v_br{region_idx}'
+            result[-1] = result[-1].rsplit('[', 1)[0] + '[v_blur]'
+
+        return result
 
     def _make_enable(self, start: float, end: float,
                      duration: Optional[float]) -> str:

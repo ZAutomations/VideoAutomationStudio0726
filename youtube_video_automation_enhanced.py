@@ -2378,6 +2378,71 @@ class VideoEffects:
                         trimmed.append((x1, y1, x2, y2))
                 regions_to_blur = trimmed
 
+            # ── Inpaint mode (AI-based removal): collect all inpaint regions ──
+            inpaint_regions = []
+            custom_regions = settings.get('custom_blur_regions', [])
+            if custom_regions and isinstance(custom_regions, list):
+                for custom_region in custom_regions:
+                    if not isinstance(custom_region, dict):
+                        continue
+                    if not custom_region.get('enabled', True):
+                        continue
+                    if custom_region.get('mode', 'blur') != 'inpaint':
+                        continue
+                    inpaint_regions.append(custom_region)
+
+            # Build composite mask and apply cv2.inpaint once for all inpaint regions
+            # OPTIMIZED: Only process the bounding box of masked areas, not the full frame
+            if inpaint_regions:
+                # Find combined bounding box of all inpaint regions with padding
+                pad = 20
+                min_x, min_y, max_x, max_y = w, h, 0, 0
+                for region in inpaint_regions:
+                    def _pct(val, dim):
+                        if isinstance(val, str) and '%' in str(val):
+                            return int(dim * float(str(val).rstrip('%')) / 100)
+                        if isinstance(val, (int, float)) and 0 <= val <= 100:
+                            return int(dim * val / 100)
+                        return int(val)
+                    rx = _pct(region.get('x', 0), w)
+                    ry = _pct(region.get('y', 0), h)
+                    rw_val = _pct(region.get('width', 100), w)
+                    rh_val = _pct(region.get('height', 100), h)
+                    rx1 = max(0, rx)
+                    ry1 = max(0, ry)
+                    rx2 = min(w, rx + rw_val)
+                    ry2 = min(h, ry + rh_val)
+                    if rx2 > rx1 and ry2 > ry1:
+                        min_x = min(min_x, rx1)
+                        min_y = min(min_y, ry1)
+                        max_x = max(max_x, rx2)
+                        max_y = max(max_y, ry2)
+                if max_x > min_x and max_y > min_y:
+                    # Expand ROI with padding, clamped to frame edges
+                    roi_x1 = max(0, min_x - pad)
+                    roi_y1 = max(0, min_y - pad)
+                    roi_x2 = min(w, max_x + pad)
+                    roi_y2 = min(h, max_y + pad)
+                    # Create mask for just the ROI
+                    roi_mask = np.zeros((roi_y2 - roi_y1, roi_x2 - roi_x1), dtype=np.uint8)
+                    for region in inpaint_regions:
+                        rx = _pct(region.get('x', 0), w)
+                        ry = _pct(region.get('y', 0), h)
+                        rw_val = _pct(region.get('width', 100), w)
+                        rh_val = _pct(region.get('height', 100), h)
+                        rx1 = max(roi_x1, min(rx, rx + rw_val))
+                        ry1 = max(roi_y1, min(ry, ry + rh_val))
+                        rx2 = min(roi_x2, max(rx, rx + rw_val))
+                        ry2 = min(roi_y2, max(ry, ry + rh_val))
+                        if rx2 > rx1 and ry2 > ry1:
+                            roi_mask[ry1 - roi_y1:ry2 - roi_y1, rx1 - roi_x1:rx2 - roi_x1] = 255
+                    if np.any(roi_mask):
+                        inpaint_radius = int(settings.get('inpaint_radius', 3))
+                        # Crop ROI, inpaint, paste back
+                        roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+                        inpainted_roi = cv2.inpaint(roi_frame, roi_mask, inpaint_radius, cv2.INPAINT_TELEA)
+                        frame[roi_y1:roi_y2, roi_x1:roi_x2] = inpainted_roi
+
             # Add custom blur regions (for hiding specific logos/watermarks)
             custom_regions = settings.get('custom_blur_regions', [])
             if custom_regions and isinstance(custom_regions, list):
@@ -2386,6 +2451,10 @@ class VideoEffects:
                         continue
 
                     if not custom_region.get('enabled', True):
+                        continue
+
+                    # Skip inpaint regions — already handled above
+                    if custom_region.get('mode', 'blur') == 'inpaint':
                         continue
 
                     # Get region coordinates (support both percentage and pixel values)
