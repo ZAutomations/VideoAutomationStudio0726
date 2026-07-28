@@ -2461,38 +2461,24 @@ class VideoEffects:
                         # the mask — this copies real background content, looks
                         # completely natural, and is O(1) numpy (no iteration).
                         # cv2.inpaint is kept as fallback for non-rectangular masks.
-                        rh_roi = roi_y2 - roi_y1
-                        rw_roi = roi_x2 - roi_x1
                         # Find masked rows within the ROI
                         masked_rows = np.where(roi_mask.any(axis=1))[0]
                         if len(masked_rows):
                             m_top = masked_rows[0]
                             m_bot = masked_rows[-1]
-                            # Sample band from just above or just below the mask
-                            sample_h = max(4, (m_bot - m_top + 1) // 2)
-                            if m_top >= sample_h:
-                                # Clone from rows above the mask
-                                src = frame[roi_y1 + m_top - sample_h:
-                                            roi_y1 + m_top, roi_x1:roi_x2]
-                            elif roi_y1 + m_bot + 1 + sample_h <= h:
-                                # Clone from rows below the mask
-                                src = frame[roi_y1 + m_bot + 1:
-                                            roi_y1 + m_bot + 1 + sample_h,
-                                            roi_x1:roi_x2]
-                            else:
-                                src = None
-                            if src is not None and src.shape[0] > 0:
-                                # Tile the sample band to fill the full mask height
-                                reps = (m_bot - m_top + 1 + src.shape[0] - 1) // src.shape[0]
-                                fill = np.tile(src, (reps, 1, 1))[:m_bot - m_top + 1]
-                                frame[roi_y1 + m_top:roi_y1 + m_bot + 1,
-                                      roi_x1:roi_x2] = fill
-                            else:
-                                # Fallback: inpaint (small radius to reduce artifact)
-                                inpainted_roi = cv2.inpaint(
-                                    roi_frame.copy(), roi_mask,
-                                    min(inpaint_radius, 2), cv2.INPAINT_TELEA)
-                                frame[roi_y1:roi_y2, roi_x1:roi_x2] = inpainted_roi
+                            fill_h = m_bot - m_top + 1
+                            abs_top = roi_y1 + m_top
+                            abs_bot = roi_y1 + m_bot
+                            # Sample one row from just above and just below the
+                            # masked band. Blend linearly between them so the
+                            # fill is a smooth gradient — looks completely
+                            # seamless even on textured or moving backgrounds.
+                            row_above = frame[max(0, abs_top - 1), roi_x1:roi_x2].astype(np.float32)
+                            row_below = frame[min(h - 1, abs_bot + 1), roi_x1:roi_x2].astype(np.float32)
+                            alphas = np.linspace(0.0, 1.0, fill_h, dtype=np.float32)
+                            blend = (row_above[None] * (1 - alphas[:, None, None])
+                                     + row_below[None] * alphas[:, None, None]).astype(np.uint8)
+                            frame[abs_top:abs_bot + 1, roi_x1:roi_x2] = blend
 
             # Add custom blur regions (for hiding specific logos/watermarks)
             custom_regions = settings.get('custom_blur_regions', [])
