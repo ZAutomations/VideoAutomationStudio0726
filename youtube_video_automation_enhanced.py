@@ -2485,6 +2485,23 @@ class VideoEffects:
                             inpainted_roi = cv2.inpaint(
                                 roi_frame.copy(), roi_mask, inpaint_radius,
                                 cv2.INPAINT_TELEA)
+                            # ✨ Smooth the crystalline inpaint texture with a
+                            # light Gaussian applied ONLY to the filled (masked)
+                            # pixels. The mask is feathered so the smoothed fill
+                            # blends seamlessly into the sharp surrounding
+                            # footage — no visible seam, no crystal grain.
+                            k = int(settings.get('inpaint_smooth', 9))
+                            if k >= 3:
+                                if k % 2 == 0:
+                                    k += 1
+                                blurred = cv2.GaussianBlur(inpainted_roi, (k, k), 0)
+                                maskf = cv2.GaussianBlur(
+                                    roi_mask.astype(np.float32) / 255.0,
+                                    (k, k), 0)[..., None]
+                                inpainted_roi = (
+                                    blurred * maskf
+                                    + inpainted_roi * (1.0 - maskf)
+                                ).astype(np.uint8)
                             frame[roi_y1:roi_y2, roi_x1:roi_x2] = inpainted_roi
                             VideoEffects.apply_region_blur._inpaint_cache = {
                                 'key': sig_key, 'sig': sig_small,
