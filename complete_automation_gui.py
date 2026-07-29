@@ -6128,7 +6128,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 _pil_y = new_h // 2 + int(_cyoff * _pil_scale)
             else:
                 _pil_y = int(new_h * 0.78) + int(_cyoff * _pil_scale)
-            _pil_fs = max(10, int(60 * new_w / 240))
+            _pil_fs = max(8, int(int(self.settings.get('caption_font_size', 60) or 60) * new_h / 1920.0))
             # Use the user's caption font style so preview matches final captions
             _pv_font_style = (self.settings.get('caption_highlight_font_style')
                               or self.settings.get('caption_font_style', 'Arial Bold') or 'Arial Bold')
