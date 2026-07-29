@@ -116,9 +116,31 @@ DEFAULT_PRESET = "bold_white"
 # GUI helper — returns human-readable label + id pairs for Tkinter
 # --------------------------------------------------------------------------- #
 def get_presets_for_gui() -> list[dict]:
-    """Return presets with ``id`` and human-readable ``label`` for the UI."""
+    """Return presets with id, label, and visual style info for the UI.
+
+    Each entry includes:
+      - id, label
+      - primary_color, highlight_color, outline_color (hex)
+      - font_family, font_size, bold, uppercase
+      - background_enabled, background_color
+      - outline (stroke width), shadow
+    """
     return [
-        {"id": pid, "label": p["label"]}
+        {
+            "id": pid,
+            "label": p["label"],
+            "primary_color": p.get("primary_color", "#FFFFFF"),
+            "highlight_color": p.get("highlight_color", "#FFD400"),
+            "outline_color": p.get("outline_color", "#000000"),
+            "font_family": p.get("font_family", "Roboto"),
+            "font_size": p.get("font_size", 90),
+            "bold": p.get("bold", True),
+            "uppercase": p.get("uppercase", True),
+            "background_enabled": p.get("background_enabled", False),
+            "background_color": p.get("background_color", "#000000"),
+            "outline": p.get("outline", 5),
+            "shadow": p.get("shadow", 1),
+        }
         for pid, p in STYLE_PRESETS.items()
     ]
 
@@ -183,16 +205,20 @@ def _group_events(
     max_chars: int,
     max_lines: int,
     max_span: float = 2.5,
+    max_words: int = 0,
 ) -> List[dict]:
     """Pack words into caption events of up to ``max_lines`` lines.
 
     A word joins the current line while it fits within ``max_chars``; otherwise it
     starts a new line, or — when the event is already ``max_lines`` tall — a new
     event. ``max_span`` caps how long one event lasts so captions keep pace with
-    speech. Each event: {"start", "end", "lines": [[word, ...], ...]}.
+    speech. ``max_words`` (>0) caps the total number of words per event as well.
+
+    Each event: {"start", "end", "lines": [[word, ...], ...]}.
     """
     events: List[dict] = []
     cur_lines: List[List[dict]] = [[]]
+    _word_count = 0  # total words in current event
 
     def event_start() -> float | None:
         for ln in cur_lines:
@@ -201,7 +227,7 @@ def _group_events(
         return None
 
     def flush() -> None:
-        nonlocal cur_lines
+        nonlocal cur_lines, _word_count
         filled = [ln for ln in cur_lines if ln]
         if filled:
             flat = [w for ln in filled for w in ln]
@@ -209,6 +235,7 @@ def _group_events(
                 {"start": flat[0]["start"], "end": flat[-1]["end"], "lines": filled}
             )
         cur_lines = [[]]
+        _word_count = 0
 
     for w in words:
         start = event_start()
@@ -220,11 +247,20 @@ def _group_events(
         if cur_line and tentative > max_chars:
             if len(cur_lines) < max_lines:
                 cur_lines.append([w])
+                _word_count += 1
             else:
                 flush()
                 cur_lines = [[w]]
+                _word_count = 1
         else:
             cur_line.append(w)
+            _word_count += 1
+
+        # Enforce max_words limit (flush if exceeded)
+        if max_words > 0 and _word_count >= max_words:
+            # Don't flush on a single word — need at least one word in the event
+            if _word_count > 1 or len(events) > 0:
+                flush()
 
     flush()
     return events
@@ -371,11 +407,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     animation = cfg.get("animation") or "none"
     max_lines = int(cfg.get("max_lines") or 1)
     max_chars = int(cfg.get("max_chars") or 22)
+    max_words = int(cfg.get("max_words") or 0)
 
     if animation == "one_word":
         events = _word_hold_events(words)
     else:
-        events = _group_events(words, max_chars=max_chars, max_lines=max_lines)
+        events = _group_events(words, max_chars=max_chars, max_lines=max_lines,
+                               max_words=max_words)
 
     dialogue_rows: List[str] = []
     for ev in events:

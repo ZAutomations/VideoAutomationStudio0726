@@ -6194,6 +6194,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         """
         regions = self.settings.get('custom_blur_regions', [])
         if not regions:
+            print("[AUTO-PLACE] No blur regions found — using defaults")
             return ('bottom', 0)
         # Find the first enabled region
         _region = None
@@ -6202,6 +6203,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 _region = r
                 break
         if not _region:
+            print("[AUTO-PLACE] No enabled blur regions found — using defaults")
             return ('bottom', 0)
 
         # Region center as percentage of frame height
@@ -6224,6 +6226,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         _yoff = int(round((_center_pct - _anchors[_best_pos]) * 1920.0 / 100.0))
         # Clamp to valid range
         _yoff = max(-200, min(200, _yoff))
+        print(f"[AUTO-PLACE] Region center={_center_pct:.1f}% -> position={_best_pos}, y_offset={_yoff:+d}px")
         return (_best_pos, _yoff)
 
     @staticmethod
@@ -12048,6 +12051,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         _preset_labels = [p['label'] for p in _presets_data]
 
         self._clipper_preset_map = dict(zip(_preset_labels, _preset_ids))
+        self._clipper_preset_data = dict(zip(_preset_ids, _presets_data))
         _saved_id = self.settings.get('clipper_caption_preset', 'bold_white')
         _saved_label = next((p['label'] for p in _presets_data if p['id'] == _saved_id), _presets_data[0]['label'])
 
@@ -12057,8 +12061,110 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                            font=('Segeo UI', 8), width=32)
         _pc.pack(fill='x', pady=2)
         _pc.bind('<<ComboboxSelected>>',
-                lambda e: self.update_setting('clipper_caption_preset',
+                lambda e: self._on_clipper_preset_change(
                     self._clipper_preset_map.get(self.clipper_preset_var.get(), 'bold_white')))
+
+        # ── Preset visual info bar (color swatches + font) ──────────────
+        _pi_f = tk.Frame(clipper_card, bg=AppStyles.BG_CARD)
+        _pi_f.pack(fill='x', padx=12, pady=(2, 2))
+        self._clipper_info_frame = _pi_f
+        self._clipper_info_widgets = []  # store widgets for rebuild
+
+        # Build initial preset info display
+        self._rebuild_clipper_preset_info(_saved_id)
+
+        # ── Override controls (color pickers, font, stroke, bg) ────────
+        _ov_f = tk.LabelFrame(clipper_card, text='🎨 Override Preset Colors/Style',
+                              bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                              font=('Segeo UI', 9, 'bold'),
+                              padx=8, pady=4)
+        _ov_f.pack(fill='x', padx=12, pady=4)
+
+        # Row 1: Highlight color + Primary color + Stroke color pickers
+        _c1 = tk.Frame(_ov_f, bg=AppStyles.BG_CARD)
+        _c1.pack(fill='x', pady=2)
+        _ov_colors = [
+            ('Override Highlight:', 'clipper_override_highlight_color', '#FFD400'),
+            ('Override Primary:', 'clipper_override_primary_color', '#FFFFFF'),
+            ('Override Stroke:', 'clipper_override_stroke_color', '#000000'),
+        ]
+        self._clipper_override_btns = {}
+        for _ov_lbl, _ov_key, _ov_def in _ov_colors:
+            _sub = tk.Frame(_c1, bg=AppStyles.BG_CARD)
+            _sub.pack(side='left', fill='x', expand=True, padx=(0, 4))
+            tk.Label(_sub, text=_ov_lbl, bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                    font=('Segeo UI', 7)).pack(anchor='w')
+            _cf = tk.Frame(_sub, bg=AppStyles.BG_CARD)
+            _cf.pack(fill='x')
+            _saved_ov = self.settings.get(_ov_key, '')
+            _ov_btn = tk.Button(_cf, text='', bg=_saved_ov if _saved_ov else AppStyles.BG_INPUT,
+                                fg='black', width=3, height=1, relief='ridge', bd=2,
+                                command=lambda k=_ov_key: self._pick_clipper_color(k))
+            _ov_btn.pack(side='left', padx=(0, 2))
+            _ov_reset = tk.Button(_cf, text='↺', font=('Segoe UI', 7), bg=AppStyles.BG_CARD,
+                                  fg=AppStyles.TEXT_MEDIUM, relief='flat', bd=0, cursor='hand2',
+                                  command=lambda k=_ov_key, b=_ov_btn: self._reset_clipper_override(k, b))
+            _ov_reset.pack(side='left')
+            self._clipper_override_btns[_ov_key] = _ov_btn
+
+        # Row 2: Font family + Stroke width + Bold toggle
+        _c2 = tk.Frame(_ov_f, bg=AppStyles.BG_CARD)
+        _c2.pack(fill='x', pady=2)
+        tk.Label(_c2, text='Font:', bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segeo UI', 7)).pack(side='left', padx=(0, 2))
+        _saved_font = self.settings.get('clipper_override_font_family', '')
+        self._ov_font_var = tk.StringVar(value=_saved_font if _saved_font else '')
+        _ov_font_cb = ttk.Combobox(_c2, textvariable=self._ov_font_var,
+                                    values=['', 'Roboto', 'Montserrat', 'Poppins', 'Anton', 'Bangers',
+                                            'Oswald', 'Bebas Neue', 'Alfa Slab One', 'Permanent Marker',
+                                            'DM Serif Display', 'Luckiest Guy', 'Segoe UI', 'Arial',
+                                            'Impact', 'Trebuchet MS', 'Georgia', 'Times New Roman'],
+                                    state='write', width=16, font=('Segeo UI', 8))
+        _ov_font_cb.pack(side='left', padx=(0, 8))
+        _ov_font_cb.bind('<<ComboboxSelected>>',
+                lambda e: self.update_setting('clipper_override_font_family', self._ov_font_var.get()))
+
+        self._ov_bold_var = tk.BooleanVar(value=self.settings.get('clipper_override_bold', False))
+        tk.Checkbutton(_c2, text='Bold', variable=self._ov_bold_var, bg=AppStyles.BG_CARD,
+                       fg=AppStyles.TEXT_MEDIUM, font=('Segeo UI', 8),
+                       command=lambda: self.update_setting('clipper_override_bold', self._ov_bold_var.get())
+                       ).pack(side='left', padx=(0, 8))
+
+        tk.Label(_c2, text='Stroke:', bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segeo UI', 7)).pack(side='left', padx=(0, 2))
+        _saved_stk = int(self.settings.get('clipper_override_stroke', 0) or 0)
+        self._ov_stroke_var = tk.IntVar(value=_saved_stk)
+        _ov_stroke_sb = tk.Spinbox(_c2, from_=0, to=15, textvariable=self._ov_stroke_var,
+                                    width=3, font=('Segeo UI', 8), bg=AppStyles.BG_INPUT,
+                                    command=lambda: self.update_setting('clipper_override_stroke',
+                                        self._ov_stroke_var.get()))
+        _ov_stroke_sb.pack(side='left', padx=(0, 8))
+
+        # Row 3: Background pill toggle + color + opacity
+        _c3 = tk.Frame(_ov_f, bg=AppStyles.BG_CARD)
+        _c3.pack(fill='x', pady=2)
+        self._ov_bg_var = tk.BooleanVar(value=self.settings.get('clipper_override_bg_enabled', False))
+        tk.Checkbutton(_c3, text='BG Pill', variable=self._ov_bg_var, bg=AppStyles.BG_CARD,
+                       fg=AppStyles.TEXT_MEDIUM, font=('Segeo UI', 8),
+                       command=lambda: self.update_setting('clipper_override_bg_enabled',
+                           self._ov_bg_var.get())).pack(side='left', padx=(0, 4))
+        _saved_bg = self.settings.get('clipper_override_bg_color', '')
+        self._ov_bg_btn = tk.Button(_c3, text='', bg=_saved_bg if _saved_bg else '#333333',
+                                    width=2, height=1, relief='ridge', bd=2,
+                                    command=lambda: self._pick_clipper_color('clipper_override_bg_color'))
+        self._ov_bg_btn.pack(side='left', padx=(0, 4))
+        # Also track bg button in the overrides dict so _pick_clipper_color can update it
+        self._clipper_override_btns['clipper_override_bg_color'] = self._ov_bg_btn
+        tk.Label(_c3, text='Opacity:', bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segeo UI', 7)).pack(side='left', padx=(0, 2))
+        _saved_op = int(self.settings.get('clipper_override_bg_opacity', 80) or 80)
+        self._ov_bg_op_var = tk.IntVar(value=_saved_op)
+        tk.Scale(_c3, from_=0, to=100, orient='horizontal', variable=self._ov_bg_op_var,
+                 length=80, bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                 highlightthickness=0, troughcolor=AppStyles.BG_CARD,
+                 font=('Segoe UI', 7), showvalue=True,
+                 command=lambda v: self.update_setting('clipper_override_bg_opacity', int(v))
+                 ).pack(side='left')
 
         # Animation mode
         _af = tk.Frame(clipper_card, bg=AppStyles.BG_CARD)
@@ -12111,6 +12217,77 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             self.settings['caption_highlight_enabled'] = False
         self.save_settings(show_popup=False)
         self.update_caption_preview()
+
+    def _rebuild_clipper_preset_info(self, preset_id: str):
+        """Rebuild the color-swatch + font-info display for the given preset."""
+        import clipper_captions as _cc_ui
+        _pd = self._clipper_preset_data.get(preset_id, {})
+        # Clear old widgets
+        for _w in getattr(self, '_clipper_info_widgets', []):
+            try:
+                _w.destroy()
+            except tk.TclError:
+                pass
+        self._clipper_info_widgets = []
+        # Font info label
+        _fam = _pd.get('font_family', 'Roboto')
+        _fs = _pd.get('font_size', 90)
+        _bold = ' Bold' if _pd.get('bold', True) else ''
+        _case = ' ALL CAPS' if _pd.get('uppercase', True) else ''
+        _fi = tk.Label(self._clipper_info_frame,
+                       text=f'Font: {_fam} {_fs}px{_bold}{_case}',
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                       font=('Segeo UI', 7), anchor='w')
+        _fi.pack(fill='x')
+        self._clipper_info_widgets.append(_fi)
+        # Color swatch row
+        _cs_f = tk.Frame(self._clipper_info_frame, bg=AppStyles.BG_CARD)
+        _cs_f.pack(fill='x', pady=(1, 0))
+        self._clipper_info_widgets.append(_cs_f)
+        _color_fields = [
+            ('Highlight', _pd.get('highlight_color', '#FFD400')),
+            ('Primary', _pd.get('primary_color', '#FFFFFF')),
+            ('Stroke', _pd.get('outline_color', '#000000')),
+            ('BG', _pd.get('background_color', '#000000')) if _pd.get('background_enabled') else None,
+        ]
+        for _field in _color_fields:
+            if _field is None:
+                continue
+            _lbl, _col = _field
+            _sub = tk.Frame(_cs_f, bg=AppStyles.BG_CARD)
+            _sub.pack(side='left', padx=(0, 8))
+            _swatch = tk.Label(_sub, text='  ', bg=_col, fg='black',
+                               width=2, height=1, relief='ridge', bd=1)
+            _swatch.pack(side='left', padx=(0, 2))
+            tk.Label(_sub, text=f'{_lbl}', bg=AppStyles.BG_CARD,
+                    fg=AppStyles.TEXT_MEDIUM, font=('Segeo UI', 7)
+                    ).pack(side='left')
+
+    def _on_clipper_preset_change(self, preset_id: str):
+        """Handle preset change — update info display + save setting."""
+        self.update_setting('clipper_caption_preset', preset_id)
+        self._rebuild_clipper_preset_info(preset_id)
+
+    def _pick_clipper_color(self, setting_key: str):
+        """Open tkinter color chooser and update the override button + setting."""
+        from tkinter import colorchooser
+        _cur = self.settings.get(setting_key, '')
+        _result = colorchooser.askcolor(color=_cur if _cur else '#FFD400',
+                                         title=f'Pick {setting_key.replace("_", " ").title()}')
+        if _result and _result[1]:
+            _hex = _result[1]
+            self.settings[setting_key] = _hex
+            self.save_settings(show_popup=False)
+            # Update button bg
+            _btn = self._clipper_override_btns.get(setting_key)
+            if _btn:
+                _btn.config(bg=_hex)
+
+    def _reset_clipper_override(self, setting_key: str, button):
+        """Clear an override so the preset default is used."""
+        self.settings[setting_key] = ''
+        self.save_settings(show_popup=False)
+        button.config(bg=AppStyles.BG_INPUT)
 
     def _inline_duration(self, parent, setting_key, default, lo=0.1, hi=10.0, length=110):
         """Compact horizontal duration slider with showvalue."""
@@ -18021,8 +18198,11 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 # Font size — blend preset value with global setting
                 _user_fs = int(self.settings.get('caption_font_size', 60) or 60)
                 _preset_fs = _preset.get('font_size', 90)
-                _blend_fs = int((_user_fs + _preset_fs) / 2)
-                _psize = max(10, int(_blend_fs * _scale * 0.6))
+                if _preset_fs > 0:
+                    _font_scale = _user_fs / _preset_fs
+                else:
+                    _font_scale = 1.0
+                _psize = max(10, int(_preset_fs * _font_scale * _scale * 0.6))
 
                 # Sample text based on animation type
                 if _animation == 'one_word':

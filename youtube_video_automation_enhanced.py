@@ -11971,64 +11971,82 @@ class VideoQuoteAutomation:
                         _cf.ensure_core_fonts()
                         _ass_path = _Path(str(self.output_folder)) / f"_clipper_{video_index}.ass"
 
-                        # Merge global caption settings as overrides (position,
-                        # Y offset, font size scaling, font family, colors,
-                        # stroke, background) so the user's Captions tab
-                        # settings affect the ASS caption rendering too.
+                        # Merge global caption settings as overrides — only position,
+                        # Y offset, and font-size scaling (placement).  The preset's
+                        # own colors / font / style are kept as-is so each preset
+                        # retains its original curated look.
                         _cc_overrides = {}
                         if _animation != 'none':
                             _cc_overrides['animation'] = _animation
-                        # Position from Global Settings
+                        # Position — only from auto-place (which already set
+                        # self.settings['caption_position']), NOT from the global
+                        # caption_position setting, so presets that specify their
+                        # own position (e.g. Neon Pop = center) keep their design.
+                        # Auto-place override at line ~9650 sets this already.
                         _gpos = self.settings.get('caption_position', 'bottom')
-                        _cc_overrides['position'] = _gpos
+                        # Only add position override if it differs from preset default
+                        _preset_pos = _cc.get_preset(_preset_id).get('position', 'bottom')
+                        if _gpos != _preset_pos:
+                            _cc_overrides['position'] = _gpos
                         # Font size scaling relative to preset default
                         _user_fs = int(self.settings.get('caption_font_size', 60) or 60)
                         _preset_fs = int(_cc.get_preset(_preset_id).get('font_size', 90))
                         if _preset_fs > 0:
                             _cc_overrides['font_scale'] = _user_fs / _preset_fs
-                        # Y offset -> pos_y percentage adjustment
+                        # Y offset -> pos_y percentage adjustment.
+                        # pos_x=50 (horizontal center) is also required because
+                        # _override_inner needs BOTH pos_x and pos_y to emit the
+                        # \an5\pos() inline tag. Without it, the offset is ignored.
+                        # The pos_y is calculated relative to the position anchor so
+                        # that auto-place correctly targets the blur region center.
                         _yoff = int(self.settings.get('caption_y_offset', 0) or 0)
+                        _yoff_anchors = {'top': 10.0, 'center': 50.0, 'bottom': 78.0}
+                        _yoff_base = _yoff_anchors.get(_gpos, 78.0)
                         if _yoff != 0:
-                            # Convert pixel offset (in 1920-high reference) to % of frame
-                            _cc_overrides['pos_y'] = 50.0 + (_yoff / 1920.0 * 100.0)
-                        # ── Font family from global caption_font_style ──────
-                        _font_st = (self.settings.get('caption_highlight_font_style')
-                                    or self.settings.get('caption_font_style', '') or '')
-                        if _font_st:
-                            # Strip weight/suffix like " Bold", " Italic" to get
-                            # the base family name. The ASS bold flag is set below.
-                            _base_fam = re.sub(r'\s+(Bold|Italic|Regular|Thin|Light|Medium|Black|Extra|Semi)$',
-                                               '', _font_st, flags=re.IGNORECASE).strip()
-                            if _base_fam:
-                                _cc_overrides['font_family'] = _base_fam
-                                # If the user picked a "Bold" variant, set bold=1
-                                if 'bold' in _font_st.lower():
-                                    _cc_overrides['bold'] = True
-                                elif 'light' in _font_st.lower() or 'thin' in _font_st.lower():
-                                    _cc_overrides['bold'] = False
-                        # ── Colors from global caption settings ─────────────
-                        _hi_col = self.settings.get('caption_highlight_color', '')
-                        if _hi_col:
-                            _cc_overrides['highlight_color'] = _hi_col
-                        _in_col = self.settings.get('caption_inactive_color', '')
-                        if _in_col:
-                            _cc_overrides['primary_color'] = _in_col
-                        # ── Stroke width from global settings ───────────────
-                        _stk_ena = self.settings.get('caption_stroke_enabled', True)
-                        if not _stk_ena:
-                            _cc_overrides['outline'] = 0
-                        else:
-                            _stk_w = int(self.settings.get('caption_stroke_width', 3) or 3)
-                            if _stk_w > 0:
-                                _cc_overrides['outline'] = _stk_w
-                        # ── Background pill from global settings ────────────
-                        _bg_ena = bool(self.settings.get('caption_bg_enabled', False))
-                        if _bg_ena:
+                            _cc_overrides['pos_x'] = 50.0
+                            _cc_overrides['pos_y'] = _yoff_base + (_yoff / 1920.0 * 100.0)
+                        elif _gpos == 'center':
+                            # Even at 0 offset, center needs the inline pos tag
+                            # since _override_inner requires the pair.
+                            _cc_overrides['pos_x'] = 50.0
+                            _cc_overrides['pos_y'] = 50.0
+
+                        # Words-per-caption: group words into segments
+                        _wpc = int(self.settings.get('caption_words_per_line', 3) or 3)
+                        _cc_overrides['max_words'] = _wpc
+                        # Caption layout → max_lines
+                        _layout = self.settings.get('caption_layout', '2-line')
+                        if _layout == '1-line':
+                            _cc_overrides['max_lines'] = 1
+                        # If layout is '2-line' we leave the preset's default max_lines
+
+                        # ── Optional overrides from clipper card (only when non-empty) ──
+                        _ov_hi = self.settings.get('clipper_override_highlight_color', '')
+                        if _ov_hi:
+                            _cc_overrides['highlight_color'] = _ov_hi
+                        _ov_pri = self.settings.get('clipper_override_primary_color', '')
+                        if _ov_pri:
+                            _cc_overrides['primary_color'] = _ov_pri
+                        _ov_stk_col = self.settings.get('clipper_override_stroke_color', '')
+                        if _ov_stk_col:
+                            _cc_overrides['outline_color'] = _ov_stk_col
+                        _ov_fam = self.settings.get('clipper_override_font_family', '')
+                        if _ov_fam:
+                            _cc_overrides['font_family'] = _ov_fam
+                        _ov_bold = self.settings.get('clipper_override_bold', False)
+                        if _ov_bold:
+                            _cc_overrides['bold'] = True
+                        _ov_stk = int(self.settings.get('clipper_override_stroke', 0) or 0)
+                        if _ov_stk > 0:
+                            _cc_overrides['outline'] = _ov_stk
+                        _ov_bg = self.settings.get('clipper_override_bg_enabled', False)
+                        if _ov_bg:
                             _cc_overrides['background_enabled'] = True
-                            _bg_col = self.settings.get('caption_bg_color', '#000000')
-                            _cc_overrides['background_color'] = _bg_col
-                            _bg_op = int(self.settings.get('caption_bg_opacity', 80) or 80)
-                            _cc_overrides['background_opacity'] = _bg_op
+                            _ov_bg_col = self.settings.get('clipper_override_bg_color', '#000000')
+                            if _ov_bg_col:
+                                _cc_overrides['background_color'] = _ov_bg_col
+                            _ov_bg_op = int(self.settings.get('clipper_override_bg_opacity', 80) or 80)
+                            _cc_overrides['background_opacity'] = _ov_bg_op
 
                         _cc.build_ass(
                             words=_ass_words,
@@ -12040,8 +12058,27 @@ class VideoQuoteAutomation:
                             overrides=_cc_overrides if _cc_overrides else None,
                         )
                         _clipper_ass_path = str(_ass_path)
+                        # Log the preset colors being used
+                        _cc_preset_debug = _cc.get_preset(_preset_id)
                         print(f"[CLIPPER CAPTIONS] ASS file created: {_ass_path.name} "
                               f"(preset={_preset_id}, anim={_animation}, {len(_ass_words)} words)")
+                        print(f"  Preset colors: primary={_cc_preset_debug.get('primary_color','?')}, "
+                              f"highlight={_cc_preset_debug.get('highlight_color','?')}, "
+                              f"font={_cc_preset_debug.get('font_family','?')} "
+                              f"{_cc_preset_debug.get('font_size','?')}px, "
+                              f"anim={_cc_preset_debug.get('animation','none')}, "
+                              f"bg={_cc_preset_debug.get('background_color','none')}")
+                        # Log the actual animation being used in the ASS
+                        _actual_anim = _cc_overrides.get('animation') or _cc_preset_debug.get('animation', 'none')
+                        print(f"  Override pos={_cc_overrides.get('position', '(preset)')}, "
+                              f"anim={_actual_anim}, "
+                              f"font_scale={_cc_overrides.get('font_scale', 1.0):.2f}")
+                        if _cc_overrides:
+                            _dbg_hi = _cc_overrides.get('highlight_color', '')
+                            _dbg_pri = _cc_overrides.get('primary_color', '')
+                            if _dbg_hi or _dbg_pri:
+                                print(f"  OVERRIDE active: highlight={_dbg_hi or '(preset)'}, "
+                                      f"primary={_dbg_pri or '(preset)'}")
                     else:
                         print("[CLIPPER CAPTIONS] No words could be generated — skipping.")
             except Exception as _cc_err:
