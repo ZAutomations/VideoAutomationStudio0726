@@ -5306,6 +5306,30 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             self._os_open_live_preview()
         cyoff_scale.config(command=_on_cyoff)
 
+        # Auto-place at inpaint region checkbox
+        _auto_pos_frame = tk.Frame(cap_pos_card, bg=AppStyles.BG_CARD)
+        _auto_pos_frame.pack(fill='x', padx=4, pady=(2, 2))
+        self._os_auto_cap_pos_var = tk.BooleanVar(
+            value=self.settings.get('our_script_auto_caption_position', False))
+        _auto_cb = tk.Checkbutton(
+            _auto_pos_frame,
+            text='🎯 Auto-place at inpaint region',
+            variable=self._os_auto_cap_pos_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            font=('Segoe UI', 8, 'bold'),
+            activebackground=AppStyles.BG_CARD,
+            selectcolor=AppStyles.BG_INPUT,
+            command=lambda: (
+                self.update_setting('our_script_auto_caption_position',
+                                    self._os_auto_cap_pos_var.get()),
+                self._os_open_live_preview(),
+            ))
+        _auto_cb.pack(anchor='w')
+        tk.Label(_auto_pos_frame,
+                 text='Automatically places captions at the center of\nthe first enabled blur/inpaint region',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 6, 'italic')).pack(anchor='w', padx=(16, 0))
+
         # ── 8. Live Log (right pane — built below) ─────────────────
         # The log no longer lives at the bottom of the left scroll container;
         # it lives in the right pane so the user can see it while scrolling
@@ -6091,8 +6115,12 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             _cap_words = _cap_txt.split()
             if len(_cap_words) > _wpc:
                 _cap_txt = ' '.join(_cap_words[:_wpc])
-            _cpos = self.settings.get('caption_position', 'bottom')
-            _cyoff = int(self.settings.get('caption_y_offset', 0))
+            # Auto-place: override position from blur/inpaint region if enabled
+            if self.settings.get('our_script_auto_caption_position', False):
+                _cpos, _cyoff = self._os_get_auto_caption_position()
+            else:
+                _cpos = self.settings.get('caption_position', 'bottom')
+                _cyoff = int(self.settings.get('caption_y_offset', 0))
             _pil_scale = new_h / 1920.0 if new_h else 1.0
             if _cpos == 'top':
                 _pil_y = int(new_h * 0.10) + int(_cyoff * _pil_scale)
@@ -6146,10 +6174,57 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self._os_preview_canvas.create_image(
             cw // 2, ch // 2, image=self._os_preview_tk_image, anchor='center')
         # Canvas overlay status bar (shows current position info)
+        _show_pos = self.settings.get('caption_position', 'bottom')
+        _show_yoff = int(self.settings.get('caption_y_offset', 0))
+        _auto_on = self.settings.get('our_script_auto_caption_position', False)
+        _status = f'Y:{_show_yoff:+d} {_show_pos}'
+        if _auto_on:
+            _status += ' [AUTO]'
         self._os_preview_canvas.create_text(
-            6, ch-6, text=f'Y:{int(self.settings.get("caption_y_offset", 0)):+d} {self.settings.get("caption_position", "bottom")}',
+            6, ch-6, text=_status,
             fill='#ffd700', font=('Segoe UI', 6, 'bold'), anchor='sw', tags='cap_status')
         self._os_preview_last_video = cache_key
+
+    def _os_get_auto_caption_position(self) -> tuple[str, int]:
+        """Calculate caption position from the first enabled blur/inpaint region.
+
+        Returns (position: str, y_offset: int) — position is one of 'top',
+        'center', 'bottom', and y_offset is the pixel fine-tune.
+        Returns ('bottom', 0) if no blur region is configured.
+        """
+        regions = self.settings.get('custom_blur_regions', [])
+        if not regions:
+            return ('bottom', 0)
+        # Find the first enabled region
+        _region = None
+        for r in regions:
+            if isinstance(r, dict) and r.get('enabled', False):
+                _region = r
+                break
+        if not _region:
+            return ('bottom', 0)
+
+        # Region center as percentage of frame height
+        _ry = float(_region.get('y', 35))
+        _rh = float(_region.get('height', 22))
+        _center_pct = _ry + _rh / 2.0
+
+        # Anchor positions (% from top for 1920-high reference)
+        _anchors = {'top': 10.0, 'center': 50.0, 'bottom': 78.0}
+        # Find closest anchor
+        _best_pos = 'bottom'
+        _best_dist = float('inf')
+        for _pos, _anchor_pct in _anchors.items():
+            _dist = abs(_center_pct - _anchor_pct)
+            if _dist < _best_dist:
+                _best_dist = _dist
+                _best_pos = _pos
+
+        # Convert y_offset: (center_pct - anchor_pct) * 1920 / 100
+        _yoff = int(round((_center_pct - _anchors[_best_pos]) * 1920.0 / 100.0))
+        # Clamp to valid range
+        _yoff = max(-200, min(200, _yoff))
+        return (_best_pos, _yoff)
 
     @staticmethod
     def _os_bb_region_dialog(parent, title, defaults=None):
@@ -9572,6 +9647,13 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
               f"position = {self.settings.get('caption_position', 'bottom')}, "
               f"y_offset = {self.settings.get('caption_y_offset', 0)}, "
               f"layout = {self.settings.get('caption_layout', '2-line')}")
+        # Auto-place captions at blur/inpaint region
+        if self.settings.get('our_script_auto_caption_position', False):
+            _apos, _ayoff = self._os_get_auto_caption_position()
+            self.settings['caption_position'] = _apos
+            self.settings['caption_y_offset'] = _ayoff
+            print(f"[OURSCRIPT] Auto-place enabled — position={_apos}, y_offset={_ayoff:+d} "
+                  f"(from first enabled blur region)")
         # Original video dialogue captions (whisper-transcribed). Independent of
         # the TTS voiceover captions — captions the courtroom/source audio that
         # plays between commentary spots.
