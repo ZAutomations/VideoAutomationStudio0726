@@ -6080,6 +6080,12 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         # rendered captions will show (not the full text blob).
         _cap_txt = caption_text.strip() if caption_text and caption_text.strip() else ''
         if _cap_txt:
+            # Strip timestamp markers [MM:SS] | and metadata like | (N words)
+            import re as _re_strip
+            _cap_txt = _re_strip.sub(r'\[?\d+:\d+\]?\s*\|\s*', '', _cap_txt)
+            _cap_txt = _re_strip.sub(r'\s*\|\s*\(?\d+\s*(?:words?)?\)?\s*', '', _cap_txt, flags=_re_strip.IGNORECASE)
+            _cap_txt = _re_strip.sub(r'\s*\|\s*\[.*?\]\s*', '', _cap_txt)
+            _cap_txt = _cap_txt.strip()
             _wpc = max(1, int(self.settings.get('caption_words_per_line', 3)))
             # Take only words_per_caption words for the preview sample
             _cap_words = _cap_txt.split()
@@ -6095,8 +6101,24 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             else:
                 _pil_y = int(new_h * 0.78) + int(_cyoff * _pil_scale)
             _pil_fs = max(10, int(60 * new_w / 240))
+            # Use the user's caption font style so preview matches final captions
+            _pv_font_style = (self.settings.get('caption_highlight_font_style')
+                              or self.settings.get('caption_font_style', 'Arial Bold') or 'Arial Bold')
+            _pv_font_map = {
+                "Arial": "arial.ttf", "Arial Black": "ariblk.ttf",
+                "Arial Bold": "arialbd.ttf", "Arial Italic": "ariali.ttf",
+                "Arial Bold Italic": "arialbi.ttf",
+                "Calibri": "calibri.ttf", "Calibri Bold": "calibrib.ttf",
+                "Segoe UI": "segoeui.ttf", "Segoe UI Bold": "segoeuib.ttf",
+                "Times New Roman": "times.ttf", "Times New Roman Bold": "timesbd.ttf",
+                "Verdana": "verdana.ttf", "Verdana Bold": "verdanab.ttf",
+                "Georgia": "georgia.ttf", "Georgia Bold": "georgiab.ttf",
+                "Impact": "impact.ttf",
+            }
+            _pv_fn = _pv_font_map.get(_pv_font_style, 'arialbd.ttf')
+            _pv_fp = str(Path(r"C:\Windows\Fonts") / _pv_fn)
             try:
-                _pil_font = ImageFont.truetype('arial.ttf', _pil_fs)
+                _pil_font = ImageFont.truetype(_pv_fp, _pil_fs) if Path(_pv_fp).exists() else ImageFont.truetype('arialbd.ttf', _pil_fs)
             except Exception:
                 _pil_font = ImageFont.load_default()
             _draw_resized = ImageDraw.Draw(pil_img, 'RGBA')

@@ -11972,8 +11972,9 @@ class VideoQuoteAutomation:
                         _ass_path = _Path(str(self.output_folder)) / f"_clipper_{video_index}.ass"
 
                         # Merge global caption settings as overrides (position,
-                        # Y offset, font size scaling) so the user's Global
-                        # Settings sliders affect the ASS caption placement too.
+                        # Y offset, font size scaling, font family, colors,
+                        # stroke, background) so the user's Captions tab
+                        # settings affect the ASS caption rendering too.
                         _cc_overrides = {}
                         if _animation != 'none':
                             _cc_overrides['animation'] = _animation
@@ -11990,6 +11991,44 @@ class VideoQuoteAutomation:
                         if _yoff != 0:
                             # Convert pixel offset (in 1920-high reference) to % of frame
                             _cc_overrides['pos_y'] = 50.0 + (_yoff / 1920.0 * 100.0)
+                        # ── Font family from global caption_font_style ──────
+                        _font_st = (self.settings.get('caption_highlight_font_style')
+                                    or self.settings.get('caption_font_style', '') or '')
+                        if _font_st:
+                            # Strip weight/suffix like " Bold", " Italic" to get
+                            # the base family name. The ASS bold flag is set below.
+                            _base_fam = re.sub(r'\s+(Bold|Italic|Regular|Thin|Light|Medium|Black|Extra|Semi)$',
+                                               '', _font_st, flags=re.IGNORECASE).strip()
+                            if _base_fam:
+                                _cc_overrides['font_family'] = _base_fam
+                                # If the user picked a "Bold" variant, set bold=1
+                                if 'bold' in _font_st.lower():
+                                    _cc_overrides['bold'] = True
+                                elif 'light' in _font_st.lower() or 'thin' in _font_st.lower():
+                                    _cc_overrides['bold'] = False
+                        # ── Colors from global caption settings ─────────────
+                        _hi_col = self.settings.get('caption_highlight_color', '')
+                        if _hi_col:
+                            _cc_overrides['highlight_color'] = _hi_col
+                        _in_col = self.settings.get('caption_inactive_color', '')
+                        if _in_col:
+                            _cc_overrides['primary_color'] = _in_col
+                        # ── Stroke width from global settings ───────────────
+                        _stk_ena = self.settings.get('caption_stroke_enabled', True)
+                        if not _stk_ena:
+                            _cc_overrides['outline'] = 0
+                        else:
+                            _stk_w = int(self.settings.get('caption_stroke_width', 3) or 3)
+                            if _stk_w > 0:
+                                _cc_overrides['outline'] = _stk_w
+                        # ── Background pill from global settings ────────────
+                        _bg_ena = bool(self.settings.get('caption_bg_enabled', False))
+                        if _bg_ena:
+                            _cc_overrides['background_enabled'] = True
+                            _bg_col = self.settings.get('caption_bg_color', '#000000')
+                            _cc_overrides['background_color'] = _bg_col
+                            _bg_op = int(self.settings.get('caption_bg_opacity', 80) or 80)
+                            _cc_overrides['background_opacity'] = _bg_op
 
                         _cc.build_ass(
                             words=_ass_words,
