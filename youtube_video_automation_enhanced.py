@@ -2494,7 +2494,12 @@ class VideoEffects:
                             # pixels. The mask is feathered so the smoothed fill
                             # blends seamlessly into the sharp surrounding
                             # footage — no visible seam, no crystal grain.
-                            k = int(settings.get('inpaint_smooth', 9))
+                            # NOTE: inpaint smooth is DISABLED by default for
+                            # caption-removal use (feathering doubles the visual
+                            # size of the affected area). The crystal artifact
+                            # only appears on large logo-removal regions; caption
+                            # strips are narrow enough that Telea stays clean.
+                            k = int(settings.get('inpaint_smooth', 0))
                             if k >= 3:
                                 if k % 2 == 0:
                                     k += 1
