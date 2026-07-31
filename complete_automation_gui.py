@@ -6161,9 +6161,19 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             else:
                 _pil_y = int(new_h * 0.78) + int(_cyoff * _pil_scale)
             _pil_fs = max(8, int(int(self.settings.get('caption_font_size', 60) or 60) * new_h / 1920.0))
-            # Use the user's caption font style so preview matches final captions
+            # Use the user's caption font style so preview matches final captions.
+            # When Pro Captions (ASS) is on, the final video is burned with the
+            # ASS preset's font, so the preview must match that (not the simple/
+            # highlight dropdowns, which are skipped in ASS mode).
             _pv_font_style = (self.settings.get('caption_highlight_font_style')
                               or self.settings.get('caption_font_style', 'Arial Bold') or 'Arial Bold')
+            if self.settings.get('clipper_captions_enabled', False):
+                try:
+                    import clipper_captions as _cc_pv
+                    _preset_id = self.settings.get('clipper_caption_preset', 'bold_white')
+                    _pv_font_style = _cc_pv.get_preset(_preset_id).get('font_family', _pv_font_style)
+                except Exception:
+                    pass
             _pv_font_map = {
                 "Arial": "arial.ttf", "Arial Black": "ariblk.ttf",
                 "Arial Bold": "arialbd.ttf", "Arial Italic": "ariali.ttf",
@@ -6175,10 +6185,23 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 "Georgia": "georgia.ttf", "Georgia Bold": "georgiab.ttf",
                 "Impact": "impact.ttf",
             }
-            _pv_fn = _pv_font_map.get(_pv_font_style, 'arialbd.ttf')
-            _pv_fp = str(Path(r"C:\Windows\Fonts") / _pv_fn)
+            _pv_fn = _pv_font_map.get(_pv_font_style)
+            _pv_fp = None
+            if _pv_fn is None:
+                # Bundled/trending fonts (e.g. "Luckiest Guy") aren't in the map —
+                # resolve them via caption_fonts so the preview matches the render.
+                try:
+                    import caption_fonts as _cf
+                    _pv_fp = _cf.resolve_font_path(_pv_font_style)
+                except Exception:
+                    _pv_fp = None
+                if _pv_fp is None:
+                    _pv_fn = 'arialbd.ttf'
+            else:
+                _pv_fp = str(Path(r"C:\Windows\Fonts") / _pv_fn)
+            _pv_fp = str(_pv_fp) if _pv_fp else ''
             try:
-                _pil_font = ImageFont.truetype(_pv_fp, _pil_fs) if Path(_pv_fp).exists() else ImageFont.truetype('arialbd.ttf', _pil_fs)
+                _pil_font = ImageFont.truetype(_pv_fp, _pil_fs) if _pv_fp and Path(_pv_fp).exists() else ImageFont.truetype('arialbd.ttf', _pil_fs)
             except Exception:
                 _pil_font = ImageFont.load_default()
             _draw_resized = ImageDraw.Draw(pil_img, 'RGBA')
@@ -12100,10 +12123,22 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
                 font=('Segoe UI', 10)).pack(anchor='w', pady=(0, 5))
 
+        # FIX 3: Add bundled fonts to Simple Style font dropdown
+        # Import bundled fonts list so user can pick trending fonts (Luckiest Guy, Bangers, etc.)
+        try:
+            from caption_fonts import TRENDING_FONTS
+            bundled_font_names = sorted(TRENDING_FONTS.keys())
+        except Exception:
+            bundled_font_names = []
+
         available_fonts = get_windows_fonts()
+        # Prepend bundled fonts at the top of the list. Bundled fonts are also
+        # installed system-wide now, so dedupe against the Windows list.
+        all_fonts = bundled_font_names + [f for f in available_fonts if f not in bundled_font_names]
+
         self.caption_font_var = tk.StringVar(value=self.settings.get('caption_font_style', 'arialbd.ttf'))
         font_combo = ttk.Combobox(font_frame, textvariable=self.caption_font_var,
-                                 values=available_fonts, state='readonly',
+                                 values=all_fonts, state='readonly',
                                  font=('Segoe UI', 9), width=30)
         font_combo.pack(fill='x', pady=5)
         font_combo.bind('<<ComboboxSelected>>',
@@ -12154,7 +12189,15 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
                 font=('Segoe UI', 10)).pack(anchor='w', pady=(0, 5))
 
-        highlight_fonts = [
+        # FIX 3: Prepend bundled ASS fonts (Luckiest Guy, Bangers, etc.) so they're
+        # pickable in CapCut highlight mode too. These render via PIL font-file lookup.
+        try:
+            from caption_fonts import TRENDING_FONTS
+            _bundled_hl_fonts = sorted(TRENDING_FONTS.keys())
+        except Exception:
+            _bundled_hl_fonts = []
+
+        highlight_fonts = _bundled_hl_fonts + [
             # ─── Bold highlights (most common in CapCut) ─────────
             'Segoe UI Bold', 'Arial Bold', 'Arial Black', 'Impact',
             'Montserrat Bold', 'Poppins Bold', 'Roboto Bold',
@@ -12180,6 +12223,9 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             'Constantia Bold', 'Constantia',
             'Corbel Bold', 'Corbel',
         ]
+        # Dedupe preserving order — bundled names above repeat in this Windows list.
+        _seen_hl = set()
+        highlight_fonts = [f for f in highlight_fonts if not (f in _seen_hl or _seen_hl.add(f))]
         self.caption_highlight_font_var = tk.StringVar(value=self.settings.get('caption_highlight_font_style', 'Segoe UI Bold'))
         hl_font_combo = ttk.Combobox(hl_font_frame, textvariable=self.caption_highlight_font_var,
                                     values=highlight_fonts, state='readonly',
@@ -12449,17 +12495,20 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             except tk.TclError:
                 pass
         self._clipper_info_widgets = []
-        # Font info label
+
+        # FIX 1: Show default font in preset info bar
+        # Font info label - show the ACTUAL preset font, not just size
         _fam = _pd.get('font_family', 'Roboto')
         _fs = _pd.get('font_size', 90)
         _bold = ' Bold' if _pd.get('bold', True) else ''
         _case = ' ALL CAPS' if _pd.get('uppercase', True) else ''
         _fi = tk.Label(self._clipper_info_frame,
-                       text=f'Font: {_fam} {_fs}px{_bold}{_case}',
-                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
-                       font=('Segeo UI', 7), anchor='w')
-        _fi.pack(fill='x')
+                       text=f'📝 Default Font: {_fam} {_fs}px{_bold}{_case}',
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       font=('Segoe UI', 8, 'bold'), anchor='w')
+        _fi.pack(fill='x', pady=(2, 0))
         self._clipper_info_widgets.append(_fi)
+
         # Color swatch row
         _cs_f = tk.Frame(self._clipper_info_frame, bg=AppStyles.BG_CARD)
         _cs_f.pack(fill='x', pady=(1, 0))
@@ -12502,12 +12551,16 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             _btn = self._clipper_override_btns.get(setting_key)
             if _btn:
                 _btn.config(bg=_hex)
+            # Refresh the live caption preview so the override is visible
+            self.update_caption_preview()
 
     def _reset_clipper_override(self, setting_key: str, button):
         """Clear an override so the preset default is used."""
         self.settings[setting_key] = ''
         self.save_settings(show_popup=False)
         button.config(bg=AppStyles.BG_INPUT)
+        # Refresh the live caption preview so the preset default comes back
+        self.update_caption_preview()
 
     def _inline_duration(self, parent, setting_key, default, lo=0.1, hi=10.0, length=110):
         """Compact horizontal duration slider with showvalue."""
@@ -18222,8 +18275,10 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 self.update_text_preview(prefix)
                 break
 
-        # Update caption preview if it's a caption setting
-        if key.startswith('caption_'):
+        # Update caption preview if it's a caption setting OR a Pro Captions
+        # (ASS) setting (clipper_caption_preset, clipper_caption_animation,
+        # clipper_override_* all change what the preview should show).
+        if key.startswith('caption_') or key.startswith('clipper_'):
             self.update_caption_preview()
 
         # Update the embedded AM Look preview whenever an AM slider /
@@ -18403,6 +18458,32 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 _bold = _preset.get('bold', True)
                 _uppercase = _preset.get('uppercase', True)
                 _bg_on = _preset.get('background_enabled', False)
+                _outline_w = int(_preset.get('outline', 5) or 5)
+                _bg_col = _preset.get('background_color', '#000000')
+                _bg_op = int(_preset.get('background_opacity', 80) or 80)
+
+                # ── Apply user overrides (Pro Captions card) on top of preset ──
+                _ov_hi = self.settings.get('clipper_override_highlight_color', '')
+                if _ov_hi:
+                    _highlight = _ov_hi
+                _ov_pri = self.settings.get('clipper_override_primary_color', '')
+                if _ov_pri:
+                    _primary = _ov_pri
+                _ov_stk_col = self.settings.get('clipper_override_stroke_color', '')
+                if _ov_stk_col:
+                    _outline_col = _ov_stk_col
+                _ov_fam = self.settings.get('clipper_override_font_family', '')
+                if _ov_fam:
+                    _font_fam = _ov_fam
+                if self.settings.get('clipper_override_bold', False):
+                    _bold = True
+                _ov_stk_w = int(self.settings.get('clipper_override_stroke', 0) or 0)
+                if _ov_stk_w > 0:
+                    _outline_w = _ov_stk_w
+                if self.settings.get('clipper_override_bg_enabled', False):
+                    _bg_on = True
+                    _bg_col = self.settings.get('clipper_override_bg_color', '') or _bg_col
+                    _bg_op = int(self.settings.get('clipper_override_bg_opacity', 80) or 80)
 
                 # Determine Y position — prefer Global Settings over preset position
                 _gpos = self.settings.get('caption_position', 'bottom')
@@ -18435,8 +18516,87 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 if _uppercase:
                     _sample = _sample.upper()
 
-                # Font weight fallback for tkinter
-                _tk_font = _font_fam
+                # FIX 2: Pro Captions preview — render with the actual bundled font
+                # via PIL. Tkinter can only use system-installed fonts, so a bundled
+                # font like "Luckiest Guy" would fall back to sans-serif in the
+                # preview even though the final ASS render uses it correctly.
+                try:
+                    from PIL import Image, ImageDraw, ImageFont
+                    import caption_fonts
+                    _font_path = caption_fonts.resolve_font_path(_font_fam)
+                    if _font_path and Path(_font_path).exists():
+                        # Render via PIL with the real font
+                        _img = Image.new('RGB', (canvas_w, canvas_h), color='#1a1a1a')
+                        _draw = ImageDraw.Draw(_img)
+                        _pil_font = ImageFont.truetype(str(_font_path), _psize)
+
+                        # Background box (blend bg color at bg_opacity over the
+                        # dark frame backdrop so the opacity override is visible)
+                        if _bg_on:
+                            _bbox = _draw.textbbox((canvas_w//2, _py), _sample, font=_pil_font, anchor='mm')
+                            try:
+                                _bh = _bg_col.lstrip('#')
+                                if len(_bh) == 3:
+                                    _bh = ''.join(c * 2 for c in _bh)
+                                _alpha = max(0, min(100, _bg_op)) / 100.0
+                                _fill = tuple(
+                                    int(int(_bh[i:i+2], 16) * _alpha + 0x1a * (1 - _alpha))
+                                    for i in (0, 2, 4)
+                                )
+                            except Exception:
+                                _fill = _bg_col
+                            _draw.rectangle([_bbox[0]-8, _bbox[1]-4, _bbox[2]+8, _bbox[3]+4], fill=_fill)
+
+                        # Outline (stroke)
+                        if _outline_w > 0:
+                            for _dx in range(-_outline_w, _outline_w+1):
+                                for _dy in range(-_outline_w, _outline_w+1):
+                                    if _dx*_dx + _dy*_dy <= _outline_w*_outline_w:
+                                        _draw.text((canvas_w//2 + _dx, _py + _dy), _sample,
+                                                 fill=_outline_col, font=_pil_font, anchor='mm')
+
+                        # Main text
+                        # Static mode: accent the middle word with the highlight
+                        # colour when it differs from primary, so the preset's
+                        # curated colour scheme is visible in the preview (many
+                        # presets share white primary + black stroke but differ
+                        # in the accent colour).
+                        _accent_ok = (_highlight or '').lower() != (_primary or '').lower()
+                        if _animation == 'highlight' or (_animation == 'none' and _accent_ok):
+                            # Multi-word with one highlighted
+                            _words = _sample.split()
+                            if len(_words) < 2:
+                                _draw.text((canvas_w//2, _py), _sample, fill=_primary, font=_pil_font, anchor='mm')
+                            else:
+                                _x = canvas_w//2 - sum(len(w) * _psize * 0.55 for w in _words) // 2
+                                for _wi, _w in enumerate(_words):
+                                    _col = _highlight if _wi == len(_words)//2 else _primary
+                                    _draw.text((_x, _py), _w, fill=_col, font=_pil_font, anchor='lm')
+                                    _x += len(_w) * _psize * 0.6
+                        else:
+                            _draw.text((canvas_w//2, _py), _sample, fill=_primary, font=_pil_font, anchor='mm')
+
+                        # Convert PIL image to tkinter PhotoImage
+                        import io
+                        _bio = io.BytesIO()
+                        _img.save(_bio, format='PNG')
+                        _bio.seek(0)
+                        _tk_img = tk.PhotoImage(data=_bio.read())
+                        canvas.create_image(0, 0, image=_tk_img, anchor='nw')
+                        canvas._preview_img = _tk_img  # keep reference
+
+                        # Metadata
+                        _meta = f'ASS · {_preset.get("label", _preset_id)} · {_animation}'
+                        canvas.create_text(canvas_w//2, canvas_h-4, text=_meta,
+                                         fill='#888', font=('Segoe UI', 7, 'italic'), anchor='s')
+                        canvas.create_text(canvas_w//2, canvas_h-16,
+                                         text=f'Font: {_font_fam} · Position: {_gpos} · Size: {_user_fs}px',
+                                         fill='#666', font=('Segoe UI', 6), anchor='s')
+                        return
+                except Exception as _pil_err:
+                    print(f"[PREVIEW] PIL font render failed: {_pil_err}, falling back to tkinter")
+
+                # FIX 2 FALLBACK: tkinter-only preview (font may not match if not system-installed)
                 if _bold:
                     _tk_font = (_font_fam, _psize, 'bold')
                 else:
@@ -18444,7 +18604,6 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
 
                 # Background box
                 if _bg_on:
-                    _bg_col = _preset.get('background_color', '#000000')
                     # Estimate text bbox and draw a box behind it
                     _est_w = len(_sample) * _psize * 0.55
                     _bx0 = (canvas_w - _est_w) // 2 - 8
@@ -18455,7 +18614,6 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                                            fill=_bg_col, outline='')
 
                 # Outline (stroke) — draw text offset in 8 directions
-                _outline_w = _preset.get('outline', 5)
                 if _outline_w > 0:
                     _steps = [(-1,-1),(-1,1),(1,-1),(1,1),(-1,0),(1,0),(0,-1),(0,1)]
                     for _dx, _dy in _steps:
@@ -18571,6 +18729,39 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         # Line spacing
         line_spacing = int(preview_font_size * 1.4)
 
+        # ── Render caption words with the REAL font via PIL overlay ─────────
+        # Tkinter's canvas can only draw fonts registered with the system and
+        # silently substitutes a fallback for bundled families (e.g. "Luckiest
+        # Guy"), so when the chosen style resolves to a font file we draw the
+        # words onto a transparent overlay and composite it on the canvas.
+        import caption_fonts as _cf
+        _real_fp = None
+        try:
+            _real_fp = _cf.resolve_font_path(caption_font_family)
+        except Exception:
+            _real_fp = None
+
+        _pil_font = None
+        _pdraw = None
+        _pil_overlay = None
+        if _real_fp and Path(_real_fp).exists():
+            try:
+                from PIL import Image as _PILImage, ImageDraw, ImageFont as _PILFont
+                _pil_overlay = _PILImage.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
+                _pdraw = ImageDraw.Draw(_pil_overlay, 'RGBA')
+                _pil_font = _PILFont.truetype(str(_real_fp), preview_font_size)
+            except Exception:
+                _pil_font, _pdraw, _pil_overlay = None, None, None
+
+        def _hex_rgba(h, alpha=255):
+            h = (h or '#FFFFFF').lstrip('#')
+            if len(h) == 3:
+                h = ''.join(ch * 2 for ch in h)
+            try:
+                return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), alpha)
+            except Exception:
+                return (255, 255, 255, alpha)
+
         # Draw captions
         for line_idx, line_words in enumerate(all_lines):
             if not line_words:
@@ -18595,16 +18786,26 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 for wi, w in enumerate(line_words):
                     is_center = (wi == len(line_words) // 2)
                     c = highlight_color if is_center else inactive_color
-                    if stroke_enabled:
-                        for dx in [-1, 0, 1]:
-                            for dy in [-1, 0, 1]:
-                                if dx != 0 or dy != 0:
-                                    canvas.create_text(x, line_y, text=w,
-                                                     font=(caption_font_family, preview_font_size),
-                                                     fill=stroke_color, anchor='w')
-                    canvas.create_text(x, line_y, text=w,
-                                     font=(caption_font_family, preview_font_size),
-                                     fill=c, anchor='w')
+                    if _pil_font is not None:
+                        if stroke_enabled:
+                            for dx in [-1, 0, 1]:
+                                for dy in [-1, 0, 1]:
+                                    if dx != 0 or dy != 0:
+                                        _pdraw.text((x + dx, line_y + dy), w, font=_pil_font,
+                                                    fill=_hex_rgba(stroke_color), anchor='lm')
+                        _pdraw.text((x, line_y), w, font=_pil_font,
+                                    fill=_hex_rgba(c), anchor='lm')
+                    else:
+                        if stroke_enabled:
+                            for dx in [-1, 0, 1]:
+                                for dy in [-1, 0, 1]:
+                                    if dx != 0 or dy != 0:
+                                        canvas.create_text(x + dx, line_y + dy, text=w,
+                                                         font=(caption_font_family, preview_font_size),
+                                                         fill=stroke_color, anchor='w')
+                        canvas.create_text(x, line_y, text=w,
+                                         font=(caption_font_family, preview_font_size),
+                                         fill=c, anchor='w')
                     x += len(w) * est_char_w + est_char_w * 0.5
             else:
                 # 2-line or multi-line — draw words individually to show highlighting
@@ -18619,17 +18820,40 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                         c = highlight_color if is_highlight else inactive_color
                     else:
                         c = inactive_color
-                    if stroke_enabled:
-                        for dx in [-1, 0, 1]:
-                            for dy in [-1, 0, 1]:
-                                if dx != 0 or dy != 0:
-                                    canvas.create_text(x, line_y, text=w,
-                                                     font=(caption_font_family, preview_font_size),
-                                                     fill=stroke_color, anchor='w')
-                    canvas.create_text(x, line_y, text=w,
-                                     font=(caption_font_family, preview_font_size),
-                                     fill=c, anchor='w')
+                    if _pil_font is not None:
+                        if stroke_enabled:
+                            for dx in [-1, 0, 1]:
+                                for dy in [-1, 0, 1]:
+                                    if dx != 0 or dy != 0:
+                                        _pdraw.text((x + dx, line_y + dy), w, font=_pil_font,
+                                                    fill=_hex_rgba(stroke_color), anchor='lm')
+                        _pdraw.text((x, line_y), w, font=_pil_font,
+                                    fill=_hex_rgba(c), anchor='lm')
+                    else:
+                        if stroke_enabled:
+                            for dx in [-1, 0, 1]:
+                                for dy in [-1, 0, 1]:
+                                    if dx != 0 or dy != 0:
+                                        canvas.create_text(x + dx, line_y + dy, text=w,
+                                                         font=(caption_font_family, preview_font_size),
+                                                         fill=stroke_color, anchor='w')
+                        canvas.create_text(x, line_y, text=w,
+                                         font=(caption_font_family, preview_font_size),
+                                         fill=c, anchor='w')
                     x += len(w) * est_char_w + est_char_w * 0.5
+
+        # Composite the PIL overlay (real font) onto the canvas
+        if _pil_overlay is not None:
+            try:
+                import io as _io
+                _bio = _io.BytesIO()
+                _pil_overlay.save(_bio, format='PNG')
+                _bio.seek(0)
+                _tk_overlay = tk.PhotoImage(data=_bio.read())
+                canvas.create_image(0, 0, image=_tk_overlay, anchor='nw')
+                canvas._preview_img = _tk_overlay  # keep reference
+            except Exception:
+                pass
 
         # Draw warning if captions are out of bounds
         if y < 0 or y > canvas_h - 20:

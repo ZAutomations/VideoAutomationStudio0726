@@ -226,7 +226,7 @@ def list_fonts() -> dict:
 
     Each entry is ``{"family", "file"}``.
     """
-    bundled = [{"family": fam, "file": fn} for fam, fn in _CORE_FONTS.items()]
+    bundled = [{"family": "Roboto", "file": fn} for fn in _CORE_FONTS]
     bundled += [{"family": fam, "file": fn} for fam, (fn, _url) in TRENDING_FONTS.items()]
     multilingual = [
         {"family": fam, "file": fn} for fam, (fn, _url) in MULTILINGUAL_FONTS.items()
@@ -234,7 +234,7 @@ def list_fonts() -> dict:
 
     # User fonts: any .ttf/.otf in the fonts dir that isn't in our known lists
     _FONTS_DIR.mkdir(parents=True, exist_ok=True)
-    known_files = {fn for fn, _url in list(_CORE_FONTS.values())}
+    known_files = set(_CORE_FONTS.keys())
     known_files |= {fn for fn, _url in list(TRENDING_FONTS.values())}
     known_files |= {fn for fn, _url in list(MULTILINGUAL_FONTS.values())}
     user: list[dict] = []
@@ -257,6 +257,72 @@ def font_path_for_family(family: str) -> Optional[Path]:
     for entry in all_fonts:
         if entry["family"].lower() == family.lower():
             return _FONTS_DIR / entry["file"]
+    return None
+
+
+def resolve_font_path(font_style: str) -> Optional[Path]:
+    """Resolve a font style string (display family name OR a .ttf/.otf filename)
+    to a real font file on disk, or None if nothing can be found.
+
+    Priority:
+      1. Bundled fonts (``assets/fonts/``) — matches a family name from
+         TRENDING_FONTS / MULTILINGUAL_FONTS / CORE_FONTS (downloading it on
+         demand if the background download hasn't finished yet), then a bare
+         filename inside the bundled fonts dir.
+      2. Windows system fonts (``C:\\Windows\\Fonts``) — matches a filename.
+
+    This lets the caption renderers accept the same values the GUI dropdowns
+    expose (e.g. ``"Luckiest Guy"`` or ``"LuckiestGuy-Regular.ttf"``) instead of
+    silently falling back to Arial.
+    """
+    if not font_style:
+        return None
+    style = str(font_style).strip()
+    if not style:
+        return None
+
+    # 1a. Bundled family name → ensure downloaded, return file path.
+    _CORE_FAMILIES = {
+        "Roboto": "Roboto-Regular.ttf",
+        "Roboto Bold": "Roboto-Bold.ttf",
+    }
+    if style in _CORE_FAMILIES:
+        _path = _FONTS_DIR / _CORE_FAMILIES[style]
+        if not _path.exists():
+            ensure_core_fonts()
+        return _path if _path.exists() else None
+    if style in TRENDING_FONTS:
+        fn, _url = TRENDING_FONTS[style]
+        _path = _FONTS_DIR / fn
+        if not _path.exists():
+            download_font_family(style)
+        return _path if _path.exists() else None
+    if style in MULTILINGUAL_FONTS:
+        fn, _url = MULTILINGUAL_FONTS[style]
+        _path = _FONTS_DIR / fn
+        if not _path.exists():
+            download_font_family(style)
+        return _path if _path.exists() else None
+    if style in _CORE_FONTS:
+        _path = _FONTS_DIR / style
+        if not _path.exists():
+            ensure_core_fonts()
+        return _path if _path.exists() else None
+
+    # 1b. Bare filename inside the bundled fonts dir (e.g. "Anton-Regular.ttf").
+    _FONTS_DIR.mkdir(parents=True, exist_ok=True)
+    for ext in ALLOWED_FONT_EXTS:
+        cand = _FONTS_DIR / style if style.lower().endswith(ext) else _FONTS_DIR / (style + ext)
+        if cand.exists():
+            return cand
+
+    # 2. Windows system font by filename.
+    win = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    for ext in ALLOWED_FONT_EXTS:
+        cand = win / style if style.lower().endswith(ext) else win / (style + ext)
+        if cand.exists():
+            return cand
+
     return None
 
 

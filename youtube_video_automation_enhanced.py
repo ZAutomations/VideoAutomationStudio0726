@@ -6491,13 +6491,23 @@ class CaptionRenderer:
 
         try:
             font_file = font_map.get(font_style)
-            if font_file is None:
+            _font_path = None
+            # Bundled/trending fonts take priority — the dropdown lists real
+            # families like "Anton" / "Bebas Neue" that font_map approximates
+            # with impact.ttf / arial.ttf, so the bundled face must win.
+            try:
+                _font_path = _cf.resolve_font_path(font_style)
+            except Exception:
+                _font_path = None
+            if _font_path is None and font_file is not None:
+                _font_path = str(Path(r"C:\Windows\Fonts") / font_file)
+            if _font_path is None:
                 # font_style may be a filename ("arialbd.ttf") instead of a display name ("Arial Bold")
                 font_file = font_style if font_style.endswith('.ttf') else font_style + '.ttf'
                 if not (Path(r"C:\Windows\Fonts") / font_file).exists():
                     font_file = 'arialbd.ttf'  # fallback
-            font_path = str(Path(r"C:\Windows\Fonts") / font_file)
-            font = ImageFont.truetype(font_path, font_size)
+                _font_path = str(Path(r"C:\Windows\Fonts") / font_file)
+            font = ImageFont.truetype(str(_font_path), font_size)
             print(f"   Using font: {font_style} ({font_file}) at {font_size}px")
 
             # Try per-script fallback fonts for non-Latin text
@@ -7066,12 +7076,22 @@ class CaptionRenderer:
                 "Arabic Typesetting Bold": "arabtype.ttf",
             }
             font_file = font_map.get(font_style)
-            if font_file is None:
+            _font_path = None
+            # Bundled/trending fonts take priority — the dropdown lists real
+            # families like "Anton" / "Bebas Neue" that font_map approximates
+            # with impact.ttf / arial.ttf, so the bundled face must win.
+            try:
+                _font_path = _cf.resolve_font_path(font_style)
+            except Exception:
+                _font_path = None
+            if _font_path is None and font_file is not None:
+                _font_path = str(Path(r"C:\Windows\Fonts") / font_file)
+            if _font_path is None:
                 font_file = font_style if font_style.endswith('.ttf') else font_style + '.ttf'
                 if not (Path(r"C:\Windows\Fonts") / font_file).exists():
                     font_file = 'arialbd.ttf'
-            font_path = str(Path(r"C:\Windows\Fonts") / font_file)
-            font = ImageFont.truetype(font_path, font_size)
+                _font_path = str(Path(r"C:\Windows\Fonts") / font_file)
+            font = ImageFont.truetype(str(_font_path), font_size)
 
             # Per-script font fallback for non-Latin text
             if _script in ('arabic', 'urdu'):
@@ -7404,8 +7424,15 @@ class CaptionRenderer:
         # Load font
         try:
             font_file = settings.get('caption_font_style', 'arialbd.ttf')
-            font_path = str(Path(r"C:\Windows\Fonts") / font_file)
-            font = ImageFont.truetype(font_path, font_size)
+            font_path = None
+            # Bundled/trending fonts (family names like "Luckiest Guy") first
+            try:
+                font_path = _cf.resolve_font_path(font_file)
+            except Exception:
+                font_path = None
+            if font_path is None:
+                font_path = str(Path(r"C:\Windows\Fonts") / font_file)
+            font = ImageFont.truetype(str(font_path), font_size)
         except:
             # Try Urdu fallback fonts if Arial fails
             try:
@@ -7667,13 +7694,20 @@ class CaptionRenderer:
                 print(f"   🌈 Rainbow mode: forcing bold font (arialbd.ttf)")
             else:
                 font_file = font_map.get(font_style)
-                if font_file is None:
+                # Bundled/trending fonts take priority over font_map lookalikes.
+                try:
+                    _bundle_fp = _cf.resolve_font_path(font_style)
+                except Exception:
+                    _bundle_fp = None
+                if _bundle_fp is not None:
+                    font_file = str(_bundle_fp)
+                elif font_file is None:
                     # font_style may be a display name ("Arial Bold") or a filename ("arialbd.ttf")
                     font_file = font_style if font_style.endswith('.ttf') else font_style + '.ttf'
                     if not (Path(r"C:\Windows\Fonts") / font_file).exists():
                         font_file = 'segoeuib.ttf'  # fallback
 
-            font_path = str(Path(r"C:\Windows\Fonts") / font_file)
+            font_path = font_file if os.path.isfile(font_file) else str(Path(r"C:\Windows\Fonts") / font_file)
             font = ImageFont.truetype(font_path, font_size)
             emoji_font_path = str(Path(r"C:\Windows\Fonts") / 'seguiemj.ttf')
             emoji_font = ImageFont.truetype(emoji_font_path, int(font_size * 0.8))
