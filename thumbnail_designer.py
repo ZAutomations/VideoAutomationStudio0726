@@ -185,11 +185,59 @@ def _text_reason(resp_json):
     return 'no image in response'
 
 
+def _is_safety_block(resp_json):
+    """True when the model refused for safety reasons (vs. a real failure)."""
+    for cand in (resp_json.get('candidates') or []):
+        fr = str(cand.get('finishReason') or cand.get('finish_reason') or '')
+        if 'SAFETY' in fr.upper() or 'PROHIBITED' in fr.upper() or 'BLOCK' in fr.upper():
+            return True
+    pf = resp_json.get('promptFeedback') or {}
+    if pf.get('blockReason'):
+        return True
+    return False
+
+
+# Charged word → brand-safe synonym.  Applied as a last-ditch rewrite when the
+# image model blocks a prompt for safety, so a critical Shorts cover still
+# renders instead of falling back to a bare frame.
+_SAFE_SUBSTITUTIONS = [
+    (r'\b(beat(?:s|ing|en)?|assault(?:s|ed|ing)?|attack(?:s|ed|ing)?|'
+     r'punch(?:es|ed|ing)?|hit(?:s|ting)?|strik(?:e|es|ing)|slap(?:s|ped|ping)?|'
+     r'abus(?:e|es|ed|ing)|kill(?:s|ed|ing)?|murder(?:s|ed|ing)?|'
+     r'stab(?:s|bed|bing)?|chok(?:e|es|ing)|strangl(?:e|es|ing))\b',
+     'confronts'),
+    (r'\b(blood(?:y|ied)?|gore|wound(?:s|ed)?|injur(?:y|ies|ed)|bruis(?:e|es|ed)|'
+     r'weapon(?:s)?|gun(?:s)?|knife|knives|corpse|dead body)\b', 'dramatic scene'),
+    (r'\b(thief|thieves|stole|stealing|steal(?:s)?|robb(?:er|ery|ed|ing))\b',
+     'money dispute'),
+    (r'\b(rape|molest(?:s|ed|ing)?|sexual)\b', 'serious accusation'),
+    (r'\b(victim)\b', 'person'),
+]
+
+
+def _soften_prompt(prompt):
+    """Rewrite a prompt with brand-safe synonyms for a safety-block retry."""
+    import re as _re
+    out = prompt or ''
+    for pat, repl in _SAFE_SUBSTITUTIONS:
+        out = _re.sub(pat, repl, out, flags=_re.IGNORECASE)
+    # Prepend an explicit safety directive so the model knows the intent.
+    guard = ('Create a bold, brand-safe, non-violent viral thumbnail. Convey '
+             'drama through facial expression, lighting and composition only — '
+             'absolutely no violence, blood, weapons, harm or graphic content. ')
+    return guard + out
+
+
 def generate_thumbnail(prompt, out_img, model=DEFAULT_MODEL, frame_path=None,
                        aspect='16:9', settings=None, log=None, timeout=180):
     """Generate a thumbnail image from *prompt* (+ optional reference frame).
 
     Returns the saved Path, or ``None`` on failure.
+
+    If the image model blocks the request for safety reasons, the prompt is
+    rewritten with brand-safe synonyms and retried once before giving up — a
+    Shorts cover is baked into the video, so a blocked thumbnail can't be
+    fixed by re-uploading later.
     """
     import requests
 
@@ -209,18 +257,22 @@ def generate_thumbnail(prompt, out_img, model=DEFAULT_MODEL, frame_path=None,
     # turns the request into a text-only model that cannot output images.
     _model = model
 
-    parts = [{'text': prompt}]
-    if frame_path:
-        fp = Path(frame_path)
-        if fp.is_file():
-            mime = 'image/png' if fp.suffix.lower() == '.png' else 'image/jpeg'
-            parts.append({'inline_data': {
-                'mime_type': mime,
-                'data': base64.b64encode(fp.read_bytes()).decode('ascii'),
-            }})
-        else:
-            log('warn', f'Thumbnail: reference frame missing ({fp}); '
-                        f'generating from prompt only')
+    def _build_parts(_prompt):
+        _parts = [{'text': _prompt}]
+        if frame_path:
+            fp = Path(frame_path)
+            if fp.is_file():
+                mime = 'image/png' if fp.suffix.lower() == '.png' else 'image/jpeg'
+                _parts.append({'inline_data': {
+                    'mime_type': mime,
+                    'data': base64.b64encode(fp.read_bytes()).decode('ascii'),
+                }})
+            else:
+                log('warn', f'Thumbnail: reference frame missing ({fp}); '
+                            f'generating from prompt only')
+        return _parts
+
+    parts = _build_parts(prompt)
 
     # Vertex AI requires ``role: "user"`` on the content; the free API
     # doesn't care (and may reject it on some models).
@@ -319,6 +371,33 @@ def generate_thumbnail(prompt, out_img, model=DEFAULT_MODEL, frame_path=None,
         return None
 
     img = _extract_image_bytes(data)
+
+    # Safety-block retry: the model refused the prompt (e.g. IMAGE_SAFETY).
+    # Rewrite the prompt with brand-safe synonyms and try ONCE more on the
+    # same (already-working) endpoint before giving up.  A Shorts cover is
+    # baked into the video, so we fight hard to produce a designed image.
+    if not img and _is_safety_block(data):
+        _soft = _soften_prompt(prompt)
+        if _soft and _soft != prompt:
+            log('warn', f'Thumbnail: {_text_reason(data)} — retrying with '
+                        f'brand-safe wording')
+            _soft_parts = _build_parts(_soft)
+            _soft_content = {'parts': _soft_parts}
+            if is_vertex:
+                _soft_content['role'] = 'user'
+            payload['contents'] = [_soft_content]
+            try:
+                resp = requests.post(resp.request.url, headers=headers,
+                                     json=payload, timeout=timeout)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    img = _extract_image_bytes(data)
+                else:
+                    log('warn', f'Thumbnail: safe-retry HTTP '
+                                f'{resp.status_code}')
+            except Exception as e:
+                log('warn', f'Thumbnail: safe-retry failed — {e}')
+
     if not img:
         log('error', f'Thumbnail: {_text_reason(data)}')
         return None

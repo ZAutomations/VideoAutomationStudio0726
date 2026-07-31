@@ -4052,6 +4052,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 self._os_refresh_video_list()
                 self._os_refresh_metadata_row()
                 self._os_open_live_preview()
+                self._os_sync_mode_buttons()
 
         def _clear_excel():
             self._os_excel_path_var.set('')
@@ -4059,6 +4060,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             self._os_refresh_video_list()
             self._os_refresh_metadata_row()
             self._os_open_live_preview()
+            self._os_sync_mode_buttons()
 
         ModernButton(xl_input, text='📂', bg_color=AppStyles.ACCENT_INFO,
                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
@@ -4066,6 +4068,34 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         ModernButton(xl_input, text='✕', bg_color='#e53e3e',
                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
                     command=_clear_excel).pack(side='left', padx=2)
+
+        # ── Single / Batch mode radio (drives what the Process button does) ──
+        # Single: process only the one Video ID selected in the dropdown.
+        # Batch : walk EVERY row of the selected Excel file in order, match
+        #         each Video ID to <channel>/videos/<id>.mp4, and process each
+        #         with that row's own data (script, title, voiceover, …).
+        mode_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
+        mode_row.pack(fill='x', padx=4, pady=(2, 0))
+        self._os_source_mode_var = tk.StringVar(
+            value=self.settings.get('our_script_source_mode', 'single'))
+
+        def _on_source_mode():
+            self.update_setting('our_script_source_mode',
+                                self._os_source_mode_var.get())
+            self._os_sync_mode_buttons()
+
+        tk.Radiobutton(
+            mode_row, text='Single video', value='single',
+            variable=self._os_source_mode_var, command=_on_source_mode,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT, activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8, 'bold')).pack(side='left')
+        tk.Radiobutton(
+            mode_row, text='Batch (all rows in Excel)', value='batch',
+            variable=self._os_source_mode_var, command=_on_source_mode,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT, activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8, 'bold')).pack(side='left', padx=(10, 0))
 
         # Video ID combobox (populated by _os_refresh_video_list)
         vid_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
@@ -4129,7 +4159,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             bg_color=AppStyles.ACCENT_SUCCESS,
             font=('Segoe UI', 10, 'bold'),
             padx=20, pady=3,
-            command=self._os_run_single)
+            command=self._os_run_selected)
         self._os_run_single_btn.pack(fill='x')
 
         # ─── Batch mode: process the entire channel ───
@@ -4164,6 +4194,8 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             command=self._os_batch_request_stop)
         self._os_batch_stop_btn.pack(side='left', padx=(6, 0))
         self._os_batch_stop_btn.config(state='disabled')
+        # Reflect the saved Single/Batch mode on the buttons at startup.
+        self._os_sync_mode_buttons()
 
         # Batch options — small row below the buttons
         opts_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
@@ -7478,6 +7510,194 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             if bracketed in video_id:
                 return rec
         return None
+
+    def _os_sync_mode_buttons(self):
+        """Relabel the main Process button to match the Single/Batch radio.
+
+        Single → '🚀 Process Selected Video' (runs the one dropdown video).
+        Batch  → '📦 Process Excel Batch (N rows)' (walks the whole Excel).
+        The button's command is a dispatcher (`_os_run_selected`) so only the
+        label needs to change here.
+        """
+        try:
+            mode = (self._os_source_mode_var.get() or 'single')
+        except Exception:
+            mode = 'single'
+        if not hasattr(self, '_os_run_single_btn'):
+            return
+        if mode == 'batch':
+            n = 0
+            try:
+                n = len(self._os_excel_batch_ids())
+            except Exception:
+                n = 0
+            label = (f'📦 Process Excel Batch ({n} rows)' if n
+                     else '📦 Process Excel Batch (select an Excel)')
+            self._os_run_single_btn.config(text=label, bg=self._btn_color('#7c3aed'))
+        else:
+            self._os_run_single_btn.config(
+                text='🚀 Process Selected Video',
+                bg=self._btn_color(AppStyles.ACCENT_SUCCESS))
+
+    def _btn_color(self, color):
+        """ModernButton stores its base color; recolor safely across versions."""
+        # ModernButton is a Canvas-based widget in this app; setting bg on it
+        # is a no-op visually, so we only try and ignore failures.
+        return color
+
+    def _os_run_selected(self):
+        """Dispatcher for the green Process button — Single vs Batch."""
+        try:
+            mode = (self._os_source_mode_var.get() or 'single')
+        except Exception:
+            mode = 'single'
+        if mode == 'batch':
+            self._os_run_excel_batch()
+        else:
+            self._os_run_single()
+
+    def _os_excel_batch_ids(self) -> list:
+        """Return Video IDs from the selected Excel, in row order, matched to
+        files that actually exist in <channel>/videos/.
+
+        This is the batch work-list: each entry is the disk stem of an mp4
+        (e.g. 'CXxz0qfqjbA') whose row appears in the Excel. Rows whose video
+        is missing on disk are skipped (logged by the caller).
+        """
+        channel = (self._os_channel_path_var.get() or '').strip()
+        if not channel:
+            return []
+        videos_dir = Path(channel) / 'videos'
+        if not videos_dir.is_dir():
+            return []
+        disk_ids = {p.stem for p in videos_dir.glob('*.mp4')}
+        xlsx = self._os_get_excel(Path(channel))
+        if xlsx is None:
+            return []
+        ordered: list = []
+        seen: set = set()
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(str(xlsx), data_only=True, read_only=True)
+            ws = wb.active
+            VID_HEADERS = ('video id', 'video_id', 'videoid', 'id', 'video')
+            vid_col = 0
+            header_values = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+            for i, h in enumerate(header_values):
+                if h is None:
+                    continue
+                if str(h).strip().lower() in VID_HEADERS:
+                    vid_col = i
+                    break
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or vid_col >= len(row):
+                    continue
+                vid = row[vid_col]
+                if vid is None or str(vid).strip() == '':
+                    continue
+                vid_s = str(vid).strip()
+                matched = None
+                if vid_s in disk_ids:
+                    matched = vid_s
+                else:
+                    bracketed = f'[{vid_s}]'
+                    for dk in disk_ids:
+                        if bracketed in dk:
+                            matched = dk
+                            break
+                if matched and matched not in seen:
+                    ordered.append(matched)
+                    seen.add(matched)
+            wb.close()
+        except Exception as e:
+            print(f'[OurScript] excel batch id read failed: {e}')
+        return ordered
+
+    def _os_run_excel_batch(self):
+        """Batch mode — process EVERY row of the selected Excel in order.
+
+        For each Video ID in the Excel, find <channel>/videos/<id>.mp4 and
+        run the full OurScript pipeline on it using that row's own data
+        (script/caption resolved per-video). Reuses the same worker thread as
+        Process Full Channel so Stop / status / voiceover-policy all apply.
+        """
+        channel = (self._os_channel_path_var.get() or '').strip()
+        if not channel:
+            messagebox.showerror(
+                'OurScript — Excel batch',
+                'Pick a Channel Folder first (📁 Channel & Video card).')
+            return
+        chan_path = Path(channel)
+        if not (chan_path / 'videos').is_dir():
+            messagebox.showerror(
+                'OurScript — Excel batch',
+                f'No videos/ folder in:\n{chan_path}')
+            return
+        xlsx = self._os_get_excel(chan_path)
+        if xlsx is None:
+            messagebox.showerror(
+                'OurScript — Excel batch',
+                'No Excel file selected. Pick one in "📊 Excel Data Source".')
+            return
+
+        todo = self._os_excel_batch_ids()
+        if not todo:
+            messagebox.showerror(
+                'OurScript — Excel batch',
+                f'No rows in the Excel matched a video in:\n'
+                f'{chan_path / "videos"}\n\n'
+                f'Excel: {Path(xlsx).name}\n'
+                f'Check the "Video ID" column matches the .mp4 filenames.')
+            return
+
+        # Optionally skip rows already rendered (same toggle the channel batch uses)
+        skip_done = bool(getattr(self, '_os_batch_skip_done_var', None)
+                         and self._os_batch_skip_done_var.get())
+        if skip_done:
+            kept = []
+            for vid in todo:
+                if (chan_path / 'videos' / f'{vid}.mp4').is_file():
+                    kept.append(vid)
+            todo = kept
+        if not todo:
+            self._os_log('header',
+                '✅ Nothing to do — every Excel row is already processed.')
+            self._os_batch_status_var.set('Idle — Excel already fully processed')
+            return
+
+        miss_policy = (getattr(self, '_os_batch_missing_audio_var', None)
+                       and self._os_batch_missing_audio_var.get()) or 'skip'
+        confirm = messagebox.askyesno(
+            'Process Excel Batch',
+            f'About to process {len(todo)} video(s) from:\n{Path(xlsx).name}\n\n'
+            f'Channel: {chan_path.name}\n'
+            f'Skip-already-done: {skip_done}\n'
+            f'On missing audio : {miss_policy}\n'
+            f'You can click ⏹ Stop at any time to halt between videos.\n\n'
+            f'Proceed?')
+        if not confirm:
+            return
+
+        self._os_batch_stop_var.set(False)
+        self._os_batch_running_var.set(True)
+        self._os_batch_btn.config(state='disabled')
+        self._os_run_single_btn.config(state='disabled')
+        self._os_batch_stop_btn.config(state='normal')
+        self._os_log('header',
+            f'═══ EXCEL BATCH START: {len(todo)} video(s) from {Path(xlsx).name} ═══')
+
+        def _worker():
+            try:
+                self._os_run_channel_worker(chan_path, todo, miss_policy)
+            finally:
+                # _os_run_channel_worker re-enables _os_batch_btn / stop; also
+                # re-enable the single button we disabled here.
+                try:
+                    self._os_run_single_btn.config(state='normal')
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _os_run_single(self):
         """Button handler — runs the OurScript pipeline on the selected
