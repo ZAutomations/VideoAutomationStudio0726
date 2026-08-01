@@ -4148,6 +4148,70 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             font=('Segoe UI', 8, 'italic'), wraplength=300, justify='left')
         self._os_metadata_label.pack(anchor='w', pady=(2, 0))
 
+        # ── Length Crop (trim) — cut seconds/parts out of the source ──────
+        # Applies BEFORE montage/captions/TTS, so everything downstream runs
+        # on the shortened timeline.  Start + end + middle cut ranges.
+        lc_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
+        lc_row.pack(fill='x', padx=4, pady=(6, 1))
+        tk.Label(lc_row, text='✂ Length Crop (trim video):',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w')
+
+        def _lc_keep(var):
+            self.update_setting(var, var.get())
+
+        # Trim start
+        lc_start_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
+        lc_start_row.pack(fill='x', padx=6)
+        tk.Label(lc_start_row, text='Cut from start',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 8)).pack(side='left')
+        self._os_trim_start_var = tk.StringVar(
+            value=self.settings.get('our_script_trim_start', ''))
+        lc_start_ent = tk.Entry(lc_start_row, textvariable=self._os_trim_start_var,
+                                bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                                font=('Segoe UI', 8), relief='flat', width=9)
+        lc_start_ent.pack(side='left', padx=(6, 2))
+        lc_start_ent.bind('<FocusOut>', lambda e: _lc_keep('our_script_trim_start'))
+        tk.Label(lc_start_row, text='(sec or mm:ss)',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 7, 'italic')).pack(side='left')
+
+        # Trim end
+        lc_end_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
+        lc_end_row.pack(fill='x', padx=6, pady=(2, 0))
+        tk.Label(lc_end_row, text='Cut from end  ',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 8)).pack(side='left')
+        self._os_trim_end_var = tk.StringVar(
+            value=self.settings.get('our_script_trim_end', ''))
+        lc_end_ent = tk.Entry(lc_end_row, textvariable=self._os_trim_end_var,
+                              bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                              font=('Segoe UI', 8), relief='flat', width=9)
+        lc_end_ent.pack(side='left', padx=(6, 2))
+        lc_end_ent.bind('<FocusOut>', lambda e: _lc_keep('our_script_trim_end'))
+        tk.Label(lc_end_row, text='(sec or mm:ss)',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 7, 'italic')).pack(side='left')
+
+        # Cut ranges from anywhere in the video
+        lc_rng_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
+        lc_rng_row.pack(fill='x', padx=6, pady=(2, 0))
+        tk.Label(lc_rng_row, text='Cut ranges ',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 8)).pack(side='left')
+        self._os_trim_ranges_var = tk.StringVar(
+            value=self.settings.get('our_script_cut_ranges', ''))
+        lc_rng_ent = tk.Entry(lc_rng_row, textvariable=self._os_trim_ranges_var,
+                              bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                              font=('Segoe UI', 8), relief='flat')
+        lc_rng_ent.pack(side='left', fill='x', expand=True, padx=(6, 0))
+        lc_rng_ent.bind('<FocusOut>',
+                        lambda e: _lc_keep('our_script_cut_ranges'))
+        tk.Label(source_card, text='e.g. 2:00-3:30, 6:10-7:45 (comma-separated)',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                font=('Segoe UI', 7, 'italic')).pack(anchor='w', padx=6)
+
         # Process button
         run_row = tk.Frame(source_card, bg=AppStyles.BG_CARD)
         run_row.pack(fill='x', padx=4, pady=(4, 2))
@@ -8021,6 +8085,288 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         import random as _rnd
         return _rnd.choice(sorted(cands))   # sorted for determinism-seed stability
 
+    # ── Length Crop (trim) helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _os_parse_ts_to_seconds(ts) -> float | None:
+        """Parse a time string into seconds.
+
+        Accepts plain seconds ("60", "60.5"), "MM:SS", or "H:MM:SS".
+        Returns None for empty / unparseable input.
+        """
+        ts = (str(ts or '').strip())
+        if not ts:
+            return None
+        parts = ts.split(':')
+        try:
+            if len(parts) == 1:
+                return float(parts[0])
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        except (ValueError, TypeError):
+            return None
+        return None
+
+    @staticmethod
+    def _os_build_keep_segments(trim_start, trim_end, cut_ranges, src_duration):
+        """Return the list of surviving ``(keep_start, keep_end)`` segments
+        (in ORIGINAL source seconds) after removing *trim_start* from the
+        front, *trim_end* from the end, and every ``(start, end)`` range in
+        *cut_ranges* from the middle.  Empty list when nothing survives."""
+        if not src_duration or src_duration <= 0:
+            return []
+        ts = trim_start if trim_start is not None else 0.0
+        te = trim_end if trim_end is not None else 0.0
+        keep = [(ts, max(ts, src_duration - te))]
+        for (cs, ce) in (cut_ranges or []):
+            cs = max(cs, 0.0)
+            ce = min(ce, src_duration)
+            if ce <= cs:
+                continue
+            new = []
+            for (ks, ke) in keep:
+                if cs >= ke or ce <= ks:
+                    new.append((ks, ke))            # no overlap
+                else:
+                    if ks < cs:
+                        new.append((ks, cs))
+                    if ce < ke:
+                        new.append((ce, ke))
+            keep = [s for s in new if s[1] - s[0] > 0.01]
+        return keep
+
+    @staticmethod
+    def _os_trim_map_timestamp(keep_segs, orig_ts) -> float | None:
+        """Map an original-source instant (seconds) to the trimmed timeline.
+
+        Returns the trimmed position, or None when the instant was removed
+        (fell inside a cut range / before the start / past the end)."""
+        offset = 0.0
+        for (ks, ke) in keep_segs:
+            if orig_ts < ks:
+                return None
+            if orig_ts <= ke:
+                return offset + (orig_ts - ks)
+            offset += ke - ks
+        return None
+
+    @staticmethod
+    def _os_trim_map_clip(keep_segs, start_s, end_s):
+        """Map a source clip ``[start_s, end_s]`` (original seconds) into
+        trimmed-timeline clip(s).
+
+        Returns a list of ``(new_start, new_end)`` — empty when the clip was
+        fully removed, or multiple clips when a cut range slices through the
+        middle of it."""
+        out = []
+        offset = 0.0
+        for (ks, ke) in keep_segs:
+            seg_lo = max(ks, start_s)
+            seg_hi = min(ke, end_s)
+            if seg_hi > seg_lo:
+                out.append((offset + (seg_lo - ks), offset + (seg_hi - ks)))
+            offset += ke - ks
+            if ke >= end_s:
+                break
+        return out
+
+    def _os_remap_script_by_trim(self, text, keep_segs):
+        """Remap every ``[MM:SS]`` line-start timestamp (except ``[00:00]``)
+        from original-source time to trimmed-timeline time.
+
+        Instants that fell inside a removed range are clamped to the start of
+        the next surviving segment so that narration for that line still plays
+        rather than being dropped entirely."""
+        if not text or not keep_segs:
+            return text
+        import re as _re
+
+        def _map_ts(sec):
+            off = 0.0
+            for (ks, ke) in keep_segs:
+                if sec < ks:
+                    return off                      # removed → clamp to segment start
+                if sec <= ke:
+                    return off + (sec - ks)
+                off += ke - ks
+            return off                              # past end → trimmed end
+
+        def _remap_one(m):
+            raw = m.group(1)
+            if raw in ('0:00', '00:00'):
+                return m.group(0)
+            try:
+                parts = [int(x) for x in raw.split(':')]
+                total = parts[0] * 60 + parts[1]
+            except (IndexError, ValueError):
+                return m.group(0)
+            new_total = _map_ts(total)
+            new_ts = f'{int(new_total) // 60:02d}:{int(new_total) % 60:02d}'
+            if '[' in m.group(0):
+                return f'[{new_ts}]'
+            return new_ts
+
+        return _re.sub(r'^\[?(\d{1,2}:\d{2})\]?', _remap_one, text,
+                       flags=_re.MULTILINE)
+
+    def _os_probe_has_audio(self, src) -> bool:
+        """Return True when the file has at least one audio stream (ffprobe)."""
+        try:
+            ff = self._find_ffmpeg() or 'ffmpeg'
+            import re as _re
+            ffprobe = _re.sub(r'ffmpeg(\.exe)?$', 'ffprobe.exe', ff,
+                              flags=_re.IGNORECASE)
+            if not os.path.exists(ffprobe):
+                ffprobe = 'ffprobe'
+            r = subprocess.run(
+                [ffprobe, '-v', 'error', '-select_streams', 'a',
+                 '-show_entries', 'stream=index', '-of',
+                 'default=noprint_wrappers=1:nokey=1', str(src)],
+                capture_output=True, text=True, timeout=15,
+            )
+            return bool((r.stdout or '').strip())
+        except Exception:
+            return True     # assume audio on probe failure (renderer handles it)
+
+    def _os_trim_ffmpeg(self, src, out, keep_segs):
+        """Trim *src* to the surviving *keep_segs* (single ffmpeg pass,
+        exact cuts) writing *out*.
+
+        Uses NVENC when available for speed, falling back to libx264.
+        Returns the output Path on success or None on failure."""
+        ff = self._find_ffmpeg() or 'ffmpeg'
+        n = len(keep_segs)
+        if n <= 0:
+            return None
+        has_audio = self._os_probe_has_audio(src)
+        v_parts, a_parts = [], []
+        v_in = ''
+        for i, (ks, ke) in enumerate(keep_segs):
+            v_parts.append(
+                f'[0:v]trim=start={ks:.3f}:end={ke:.3f},'
+                f'setpts=PTS-STARTPTS[v{i}]')
+            v_in += f'[v{i}]'
+            if has_audio:
+                a_parts.append(
+                    f'[0:a]atrim=start={ks:.3f}:end={ke:.3f},'
+                    f'asetpts=PTS-STARTPTS[a{i}]')
+        if has_audio:
+            # concat with a=1 wants the inputs INTERLEAVED per segment
+            # ([v0][a0][v1][a1]…), not all videos then all audios — ffmpeg
+            # errors with a media-type mismatch otherwise.
+            interleaved = ''.join(f'[v{i}][a{i}]' for i in range(n))
+            filter_complex = (
+                ';'.join(v_parts + a_parts)
+                + f';{interleaved}concat=n={n}:v=1:a=1[vout][aout]')
+        else:
+            filter_complex = (
+                ';'.join(v_parts)
+                + f';{v_in}concat=n={n}:v=1:a=0[vout]')
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        def _run(enc_args):
+            cmd = [ff, '-y', '-loglevel', 'error',
+                   '-i', str(src), '-filter_complex', filter_complex,
+                   '-map', '[vout]']
+            if has_audio:
+                cmd += ['-map', '[aout]', '-c:a', 'aac', '-b:a', '160k']
+            cmd += enc_args + [str(out)]
+            return subprocess.run(cmd, capture_output=True, timeout=1800)
+
+        # Prefer hardware NVENC for the intermediate (fast), else libx264.
+        try:
+            r = _run(['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '20',
+                      '-pix_fmt', 'yuv420p'])
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or b'').decode('utf-8', 'replace')[-300:])
+        except Exception:
+            try:
+                r = _run(['-c:v', 'libx264', '-preset', 'veryfast',
+                          '-crf', '19', '-pix_fmt', 'yuv420p'])
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        (r.stderr or b'').decode('utf-8', 'replace')[-300:])
+            except Exception as e:
+                self._os_log('error', f'Length Crop: ffmpeg trim failed — {e}')
+                return None
+        if not out.is_file() or out.stat().st_size == 0:
+            self._os_log('error', 'Length Crop: trim produced no file')
+            return None
+        return out
+
+    def _os_apply_length_crop(self, video_path, video_id: str = ''):
+        """Apply the user's Length Crop settings to *video_path*.
+
+        Returns ``(working_path, keep_segs, tmp_path)``:
+          - *working_path*: the trimmed copy when a crop is active, else the
+            original file unchanged.
+          - *keep_segs*: surviving ``(start, end)`` segments in ORIGINAL source
+            seconds (used to remap montage/commentary/script timestamps), or
+            [] when no trim ran.
+          - *tmp_path*: the intermediate file to delete after the render (or
+            None when nothing was created).
+        """
+        t_start = self._os_parse_ts_to_seconds(
+            self.settings.get('our_script_trim_start', ''))
+        t_end = self._os_parse_ts_to_seconds(
+            self.settings.get('our_script_trim_end', ''))
+        cut_ranges = []
+        raw_ranges = (self.settings.get('our_script_cut_ranges', '') or '').strip()
+        if raw_ranges:
+            import re as _re
+            for mm in _re.finditer(
+                    r'(\d{1,2}:\d{2}|\d+(?:\.\d+)?)\s*-\s*'
+                    r'(\d{1,2}:\d{2}|\d+(?:\.\d+)?)', raw_ranges):
+                s = self._os_parse_ts_to_seconds(mm.group(1))
+                e = self._os_parse_ts_to_seconds(mm.group(2))
+                if s is not None and e is not None and e > s:
+                    cut_ranges.append((s, e))
+        if t_start is None and t_end is None and not cut_ranges:
+            return video_path, [], None
+
+        src = Path(video_path)
+        if not src.is_file():
+            self._os_log('warn',
+                'Length Crop: source missing — skipping trim')
+            return video_path, [], None
+
+        dur, _fps = self._probe_video_duration_fps(src)
+        if not dur or dur <= 0:
+            self._os_log('warn',
+                'Length Crop: could not read source duration — skipping trim')
+            return video_path, [], None
+
+        keep = self._os_build_keep_segments(t_start, t_end, cut_ranges, dur)
+        if not keep:
+            self._os_log('error',
+                'Length Crop: the configured cuts remove the ENTIRE video — '
+                'skipping trim')
+            return video_path, [], None
+        if len(keep) == 1 and keep[0][0] <= 0.01 and keep[0][1] >= dur - 0.01:
+            self._os_log('info', 'Length Crop: nothing to cut (ranges outside '
+                                f'video, {dur:.1f}s) — skipping')
+            return video_path, [], None
+
+        import tempfile
+        _tmp_dir = Path(tempfile.gettempdir()) / 'OurScript_LengthCrop'
+        _stem = (video_id or src.stem)
+        out = _tmp_dir / f'{_stem}_lengthcrop.mp4'
+        self._os_log('info',
+            f'Length Crop: cutting {dur:.1f}s source → '
+            f'{sum(ke - ks for ks, ke in keep):.1f}s '
+            f'(drop {dur - sum(ke - ks for ks, ke in keep):.1f}s)…')
+        trimmed = self._os_trim_ffmpeg(src, out, keep)
+        if trimmed is None:
+            self._os_log('error',
+                'Length Crop: trim failed — continuing with the FULL video')
+            return video_path, [], None
+        self._os_log('ok',
+            f'Length Crop: ✅ trimmed → {out.name} '
+            f'({out.stat().st_size:,} bytes)')
+        return trimmed, keep, out
+
     # ── Core render entry-points ──────────────────────────────────────────
 
     def _os_probe_dimensions(self, video_path):
@@ -8076,6 +8422,18 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self._os_log('header', f'═══ Run started: video_id={video_id} ═══')
         self._os_log('path', f'Channel : {channel}')
         self._os_log('path', f'Video   : {video_path.name}')
+
+        # ── Length Crop (trim) — applied to the SOURCE before anything else ─
+        # The user may cut seconds from the start, the end, and/or arbitrary
+        # ranges from the middle.  The source is pre-trimmed into a working
+        # copy so captions / TTS / montage all operate on the shortened
+        # timeline; ``_keep_segs`` lets us remap every timestamp that used to
+        # reference original-source time (montage clips, commentary spots,
+        # [MM:SS] script markers).
+        _keep_segs = []
+        _lc_tmp = None
+        video_path, _keep_segs, _lc_tmp = self._os_apply_length_crop(
+            video_path, video_id)
 
         # ── Montage pre-processing (Case Commentary integration) ───────────
         # Read the Excel row to check for "Montage Clips" and "Commentary
@@ -8223,7 +8581,6 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                                 if end_s - start_s > _MAX_CLIP_SEC:
                                     end_s = start_s + _MAX_CLIP_SEC
                                 _parsed.append((start_s, end_s))
-                        _clip_count = len(_parsed)
                         # Courtroom story-cut prepends a 15s source intro clip
                         # so the [00:00] summary narration has footage under it
                         # and commentary spots start AFTER it.  Movie recaps
@@ -8235,6 +8592,20 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                         if _prepend_intro:
                             _parsed.insert(0, (0, _INTRO_CLIP_SEC))
                             _clip_count = len(_parsed)
+                        # Length-crop remap: the clip coords above (including
+                        # the prepended intro) are in ORIGINAL source time, but
+                        # the source has been pre-trimmed — express them in the
+                        # trimmed file's timeline (a cut range can even split
+                        # one clip in two; a fully-removed clip drops out).
+                        if _keep_segs:
+                            _parsed = [seg
+                                       for (start_s, end_s) in _parsed
+                                       for seg in self._os_trim_map_clip(
+                                           _keep_segs, start_s, end_s)]
+                            _prepend_intro = _prepend_intro and bool(_parsed)
+                        # Always recompute the count — it must reflect the
+                        # (possibly remapped / clipped) final clip list.
+                        _clip_count = len(_parsed)
                         _intro_dur = _INTRO_CLIP_SEC if _prepend_intro and _parsed else 0
                         if _clip_count > 0:
                             try:
@@ -8611,6 +8982,15 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                                 _ts_sec_raw = (
                                     int(_spm.group(1)) * 60
                                     + int(_spm.group(2)))
+                                # Length-crop remap: spot timestamps reference
+                                # ORIGINAL source time — convert to the trimmed
+                                # timeline first (skip if its moment was cut).
+                                if _keep_segs:
+                                    _ts_trim = self._os_trim_map_timestamp(
+                                        _keep_segs, _ts_sec_raw)
+                                    if _ts_trim is None:
+                                        continue
+                                    _ts_sec_raw = _ts_trim
                                 if _story_cut and _parsed:
                                     _ts_sec = self._remap_to_stitched_timeline(
                                         _ts_sec_raw, _parsed)
@@ -8740,16 +9120,24 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                 channel, video_id, source_override=tts_column)
             if not tts_text:
                 tts_text = caption_text  # fallback
-            # If a montage intro was prepended (montage_duration > 0), shift
-            # any [MM:SS] timestamps in the TTS text too to align with
-            # the output video (full source or stitched, accordingly).
-            if montage_duration and tts_text:
-                if _story_cut and _parsed:
+            if tts_text:
+                # Length-crop remap FIRST — [MM:SS] script markers reference
+                # ORIGINAL source time; convert them to the trimmed timeline
+                # (works even with no montage, e.g. a plain "cut 1 min from
+                # the start" run — without this the narration would lag behind
+                # by exactly the trimmed seconds).
+                if _keep_segs:
+                    tts_text = self._os_remap_script_by_trim(
+                        tts_text, _keep_segs)
+                # If a montage intro was prepended (montage_duration > 0),
+                # shift the now-trimmed markers to align with the output video
+                # (full source or stitched, accordingly).
+                if montage_duration and _story_cut and _parsed:
                     _shifted = self._remap_script_timestamps(tts_text, _parsed)
                     if _shifted != tts_text:
                         self._os_log('info', 'Montage: remapped TTS timestamps to stitched')
                         tts_text = _shifted
-                else:
+                elif montage_duration:
                     _shifted = self._shift_script_timestamps(
                         tts_text, int(montage_duration))
                     if _shifted != tts_text:
@@ -8902,7 +9290,20 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             self._os_log('warn', f'Could not save settings (worker thread): {e}')
 
         self._os_log('info', 'Starting render …')
-        self._os_render_one_video(channel, video_id, video_path, vo_path, caption_text)
+        try:
+            self._os_render_one_video(
+                channel, video_id, video_path, vo_path, caption_text)
+        finally:
+            # Length Crop: the trimmed working copy lives in the system temp
+            # dir — remove it after the render so it never lingers.
+            if _lc_tmp is not None:
+                try:
+                    if _lc_tmp.exists():
+                        _lc_tmp.unlink()
+                        self._os_log('info',
+                            f'Length Crop: cleaned up {_lc_tmp.name}')
+                except Exception:
+                    pass
     def _os_resolve_caption_text(self, channel: Path, video_id: str,
                                  source_override: str = None) -> str:
         """Resolve the caption text to draw for the selected video_id.
