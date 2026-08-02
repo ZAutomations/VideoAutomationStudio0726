@@ -66,24 +66,53 @@ _log = lambda *a, **kw: print(*a, file=sys.stderr, **kw)
 
 def _resolve_local_model(model_size: str):
     """Return a path to a bundled faster-whisper model folder if one ships
-    next to this script, else ``None`` (→ let faster-whisper auto-download).
+    next to this script (or is cached under ~/.cache/huggingface), else
+    ``None`` (→ let faster-whisper auto-download).
 
     Looked-up locations (first hit wins), so the model travels with the
     portable folder and never needs internet on a fresh PC::
 
         <script_dir>/models/whisper/faster-whisper-<size>/
         <script_dir>/models/whisper/<size>/
+        <script_dir>/models/whisper/models--Systran--faster-whisper-<size>/snapshots/*/
+        <script_dir>/models/whisper/models--Systran--faster-distil-whisper-<size>/snapshots/*/
+        ~/.cache/huggingface/hub/models--Systran--faster-whisper-<size>/snapshots/*/
+        ~/.cache/huggingface/hub/models--Systran--faster-distil-whisper-<size>/snapshots/*/
+
+    The HF-cache layouts (with the ``models--`` prefix + ``snapshots/*``) are
+    what HuggingFace downloader writes — checking them here means an already-
+    downloaded model is used locally instead of silently re-downloading the
+    whole thing from the hub (which is what made a 3 GB large-v3 time out).
     """
     from pathlib import Path
     here = Path(__file__).resolve().parent
+    # distil-large-v3 → repo `Systran/faster-distil-whisper-large-v3`, NOT
+    # `faster-whisper-distil-large-v3` (that's the flat bundled folder name).
+    short = model_size
+    if short.startswith("distil-"):
+        short = short[len("distil-"):]
     candidates = [
         here / "models" / "whisper" / f"faster-whisper-{model_size}",
         here / "models" / "whisper" / model_size,
     ]
+    try:
+        user_cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+    except Exception:
+        user_cache_root = None
+    for repo in (f"faster-whisper-{model_size}",
+                 f"faster-distil-whisper-{short}"):
+        candidates.append(here / "models" / "whisper"
+                          / f"models--Systran--{repo}")
+        if user_cache_root is not None:
+            candidates.append(user_cache_root / f"models--Systran--{repo}")
     for c in candidates:
-        # A valid CTranslate2 model folder contains model.bin + config.json
+        # A valid CTranslate2 model folder contains model.bin + config.json.
+        # HF-cache layout puts the files under snapshots/<hash>/.
         if (c / "model.bin").is_file() and (c / "config.json").is_file():
             return str(c)
+        for snap in c.glob("snapshots/*"):
+            if (snap / "model.bin").is_file() and (snap / "config.json").is_file():
+                return str(snap)
     return None
 
 
@@ -596,7 +625,8 @@ def extract_word_timestamps(audio_path: str, model_size: str = "medium",
 
     Args:
         audio_path: Path to audio file (mp3, wav, m4a, etc.)
-        model_size: Preferred model size (tiny, base, small, medium, large-v3)
+        model_size: Preferred model size (tiny, base, small, medium, large-v3,
+                     distil-large-v3)
         language: Language code (e.g., 'en') or None for auto-detect
         diarize: Whether to run speaker diarization
         hf_token: Hugging Face read token (needed for pyannote hub fallback)
@@ -656,7 +686,7 @@ def main():
     parser.add_argument("--output", "-o", help="Output JSON file path")
     parser.add_argument("--model", "-m", default="medium",
                         help="Whisper model size (tiny, base, small, medium, "
-                             "large-v3). Default: medium")
+                             "large-v3, distil-large-v3). Default: medium")
     parser.add_argument("--language", "-l", default=None,
                         help="Language code (e.g., 'en'). Auto-detected if omitted.")
     # Diarization flags

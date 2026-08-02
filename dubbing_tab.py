@@ -273,24 +273,36 @@ class DubbingTabMixin:
 
         # Whisper model size — lets low-VRAM GPUs (e.g. Quadro M1200, 4GB)
         # drop to 'base'/'small' while big GPUs use 'medium'/'large-v3'.
+        # 'distil-large-v3' ≈ large-v3 accuracy at ~6× the speed (English).
         mrow = tk.Frame(src_card, bg=AppStyles.BG_CARD)
         mrow.pack(fill='x', padx=8, pady=(0, 6))
         tk.Label(mrow, text='Whisper model:', bg=AppStyles.BG_CARD,
                  fg=AppStyles.TEXT_DARK, font=('Segoe UI', 9)).pack(side='left')
         self._dub_whisper_model_var = tk.StringVar(
             value=self.settings.get('dub_whisper_model', 'medium'))
-        model_combo = ttk.Combobox(
+        self._dub_model_combo = ttk.Combobox(
             mrow, textvariable=self._dub_whisper_model_var,
-            values=['tiny', 'base', 'small', 'medium', 'large-v3'],
+            values=['tiny', 'base', 'small', 'medium', 'large-v3',
+                    'distil-large-v3'],
             state='readonly', width=18)
-        model_combo.pack(side='left', padx=(6, 0))
-        model_combo.bind('<<ComboboxSelected>>', lambda e: self.update_setting(
-            'dub_whisper_model', self._dub_whisper_model_var.get()))
+        self._dub_model_combo.pack(side='left', padx=(6, 0))
+        self._dub_model_combo.bind(
+            '<<ComboboxSelected>>',
+            lambda e: (self.update_setting('dub_whisper_model',
+                                           self._dub_whisper_model_var.get()),
+                       self._dub_refresh_whisper_status()))
         tk.Label(mrow,
                  text='  Bigger = more accurate but needs more VRAM/time. '
                       'Use "base"/"small" on old or 4GB GPUs.',
                  bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
                  font=('Segoe UI', 8, 'italic')).pack(side='left', padx=(8, 0))
+        # Path-status label: tells you whether the selected model is already
+        # on disk (and where) or will trigger a hub download on first use.
+        self._dub_whisper_status = tk.Label(
+            src_card, bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+            font=('Segoe UI', 8), justify='left', anchor='w')
+        self._dub_whisper_status.pack(fill='x', padx=8, pady=(0, 6))
+        self._dub_refresh_whisper_status()
 
         # ── 3) Target language ─────────────────────────────────────────
         lang_card = self._dub_card(scrollable, '🌐 Target Language')
@@ -615,6 +627,64 @@ class DubbingTabMixin:
         except Exception:
             pass  # will fail downstream if the dir is unwritable
         return output_dir / src.name  # keep original filename
+
+    def _dub_whisper_model_paths(self, model_size):
+        """Candidate locations for a whisper model, mirroring the lookup in
+        ``_whisper_word_timestamps.py::_resolve_local_model`` so the status
+        label agrees with what the subprocess will actually find.
+
+        Returns (bundled_flat, bundled_hf, user_hf): the three places a model
+        can live, each a Path (may not exist).
+        """
+        here = Path(__file__).resolve().parent
+        short = model_size
+        if short.startswith('distil-'):
+            short = short[len('distil-'):]
+        # Flat bundled folders travel with the portable app.
+        bundled_flat = here / 'models' / 'whisper' / f'faster-whisper-{model_size}'
+        # HF-cache layout: the `models--` prefix + snapshots/<hash>/.
+        bundled_hf = (here / 'models' / 'whisper'
+                      / f'models--Systran--faster-whisper-{model_size}')
+        user_hf = (Path.home() / '.cache' / 'huggingface' / 'hub'
+                   / f'models--Systran--faster-whisper-{model_size}')
+        # distil-large-v3 lives under the distil repo name in HF-cache form.
+        if short != model_size:
+            bundled_hf = (here / 'models' / 'whisper'
+                          / f'models--Systran--faster-distil-whisper-{short}')
+            user_hf = (Path.home() / '.cache' / 'huggingface' / 'hub'
+                       / f'models--Systran--faster-distil-whisper-{short}')
+        return bundled_flat, bundled_hf, user_hf
+
+    def _dub_find_whisper_model(self, model_size):
+        """Return the on-disk folder for ``model_size`` if found, else None.
+        Checks flat bundle, app-level HF cache, then the user HF cache."""
+        for root in self._dub_whisper_model_paths(model_size):
+            try:
+                if (root / 'model.bin').is_file() and (root / 'config.json').is_file():
+                    return root
+                for snap in root.glob('snapshots/*'):
+                    if (snap / 'model.bin').is_file() and (snap / 'config.json').is_file():
+                        return snap
+            except OSError:
+                continue
+        return None
+
+    def _dub_refresh_whisper_status(self):
+        """Refresh the whisper-model status label: found (where) vs will-download."""
+        if not hasattr(self, '_dub_whisper_status'):
+            return
+        model = self._dub_whisper_model_var.get() if hasattr(
+            self, '_dub_whisper_model_var') else 'medium'
+        found = self._dub_find_whisper_model(model)
+        if found is not None:
+            self._dub_whisper_status.config(
+                text=f'✅ {model} installed at:\n   {found}',
+                fg=AppStyles.ACCENT_PRIMARY)
+        else:
+            self._dub_whisper_status.config(
+                text=(f'⚠️ {model} NOT downloaded — will auto-download on '
+                      f'first use (needs internet, can take a while).'),
+                fg='#e3b341')
 
     def _dub_refresh_batch_count(self):
         """Update the '(N videos found)' hint next to the folder picker."""

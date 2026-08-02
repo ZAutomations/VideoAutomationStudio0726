@@ -14991,7 +14991,8 @@ class VideoQuoteAutomation:
         try:
             result = subprocess.run(
                 [venv_python, str(whisper_script), audio_to_transcribe,
-                 '--model', 'base', '--language', 'en'],
+                 '--model', str(self.settings.get('whisper_model', 'base')),
+                 '--language', 'en'],
                 capture_output=True, text=True, timeout=600  # 10 min for model download
             )
             if result.returncode != 0:
