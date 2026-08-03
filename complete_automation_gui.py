@@ -876,6 +876,35 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self.create_path_field(input_card, 'Video Folder:', self.video_folder_var, self.browse_video_folder)
         self.create_path_field(input_card, 'Quotes / Transcript (.txt/.xlsx):', self.quotes_file_var, self.browse_quotes_file)
 
+        # Whisper Model — pick the speech-to-text model used by the whole
+        # pipeline (dialogue captions, word timing, etc.). Shows whether the
+        # model is on disk (and where) or will auto-download on first use.
+        whisper_field = tk.Frame(input_card, bg=AppStyles.BG_CARD)
+        whisper_field.pack(fill='x', padx=10, pady=5)
+        tk.Label(whisper_field, text='🎙️ Whisper Model (Speech-to-Text):',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8)).pack(anchor='w', pady=(0, 3))
+        whisper_row = tk.Frame(whisper_field, bg=AppStyles.BG_CARD)
+        whisper_row.pack(fill='x')
+        WHISPER_MODEL_CHOICES = ['tiny', 'base', 'small', 'medium', 'large-v3', 'distil-large-v3']
+        self.whisper_model_var = tk.StringVar(
+            value=self.settings.get('whisper_model', 'base'))
+        whisper_dropdown = ttk.Combobox(whisper_row, textvariable=self.whisper_model_var,
+                                        values=WHISPER_MODEL_CHOICES,
+                                        state='readonly', width=16)
+        whisper_dropdown.pack(side='left')
+        whisper_dropdown.bind('<<ComboboxSelected>>', self._on_whisper_model_changed)
+        ModernButton(whisper_row, text='🔍 Recheck',
+                     bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 8, 'bold'), padx=8, pady=2,
+                     command=self._update_whisper_path_status).pack(side='left', padx=(5, 0))
+        self.whisper_path_label = tk.Label(whisper_field, text='', bg=AppStyles.BG_CARD,
+                                           fg=AppStyles.TEXT_MEDIUM,
+                                           font=('Segoe UI', 7), wraplength=280,
+                                           justify='left')
+        self.whisper_path_label.pack(anchor='w', pady=(3, 0))
+        self._update_whisper_path_status()
+
         # Output Settings Card
         output_card = self.create_grid_card(grid_container, "📂 Output Settings", row=0, col=1)
         self.create_path_field(output_card, 'Output Folder:', self.output_folder_var, self.browse_output_folder)
@@ -1230,50 +1259,8 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self.height_var.trace('w', lambda *args: update_aspect_info())
         update_aspect_info()
 
-        # ROW 5: Whisper Model — pick the speech-to-text model used by the
-        # whole pipeline (dialogue captions, word timing, etc.) and show where
-        # the model should live so the user can verify it's on disk.
-        whisper_card = self.create_grid_card(grid_container, "🎙️ Whisper Model (Speech-to-Text)", row=4, col=0, colspan=3)
-        whisper_body = tk.Frame(whisper_card, bg=AppStyles.BG_CARD)
-        whisper_body.pack(fill='x', padx=20, pady=10)
-
-        whisper_row = tk.Frame(whisper_body, bg=AppStyles.BG_CARD)
-        whisper_row.pack(fill='x', pady=(0, 6))
-
-        tk.Label(whisper_row, text='Model:',
-                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
-                 font=('Segoe UI', 10, 'bold')).pack(side='left', padx=(0, 10))
-
-        WHISPER_MODEL_CHOICES = ['tiny', 'base', 'small', 'medium', 'large-v3', 'distil-large-v3']
-        self.whisper_model_var = tk.StringVar(
-            value=self.settings.get('whisper_model', 'base'))
-        whisper_dropdown = ttk.Combobox(whisper_row, textvariable=self.whisper_model_var,
-                                        values=WHISPER_MODEL_CHOICES,
-                                        state='readonly', width=16)
-        whisper_dropdown.pack(side='left', padx=(0, 10))
-        whisper_dropdown.bind('<<ComboboxSelected>>', self._on_whisper_model_changed)
-
-        ModernButton(whisper_row, text='🔍 Recheck',
-                     bg_color=AppStyles.ACCENT_INFO,
-                     font=('Segoe UI', 9, 'bold'), padx=10, pady=4,
-                     command=self._update_whisper_path_status).pack(side='left')
-
-        tk.Label(whisper_body,
-                 text='Larger models = more accurate (esp. non-English) but slower & bigger. '
-                      'Missing models auto-download on first use (needs internet).',
-                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
-                 font=('Segoe UI', 8, 'italic'), wraplength=760,
-                 justify='left').pack(anchor='w', pady=(0, 6))
-
-        self.whisper_path_label = tk.Label(whisper_body, text='', bg=AppStyles.BG_CARD,
-                                           fg=AppStyles.TEXT_MEDIUM,
-                                           font=('Segoe UI', 8), wraplength=760,
-                                           justify='left')
-        self.whisper_path_label.pack(anchor='w')
-        self._update_whisper_path_status()
-
-        # ROW 6: Alight Motion Look Builder (full width)
-        am_card = self.create_grid_card(grid_container, "🎨 Alight Motion Look Builder (Viral Reels & More)", row=5, col=0, colspan=3)
+        # ROW 5: Alight Motion Look Builder (full width)
+        am_card = self.create_grid_card(grid_container, "🎨 Alight Motion Look Builder (Viral Reels & More)", row=4, col=0, colspan=3)
 
         am_body = tk.Frame(am_card, bg=AppStyles.BG_CARD)
         am_body.pack(fill='x', padx=20, pady=10)
@@ -1487,46 +1474,51 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         self._update_whisper_path_status()
 
     def _whisper_model_paths(self, model_size: str):
-        """Return (bundled_paths, hf_cache_path) where a whisper model may live.
+        """Candidate roots where a whisper model may live, in lookup order.
 
-        Mirrors the lookup order of ``_whisper_word_timestamps.py``: bundled
-        folders next to the app first, then the HuggingFace cache (where
-        faster-whisper auto-downloads a missing model).
+        Mirrors ``_whisper_word_timestamps.py::_resolve_local_model`` so the
+        status label agrees with what the subprocess actually finds: flat
+        bundled folders first, then the `models--` HF-cache folder next to the
+        app, then the user-level HuggingFace cache.
         """
         here = Path(__file__).resolve().parent
-        bundled = [
+        roots = [
             here / 'models' / 'whisper' / f'faster-whisper-{model_size}',
             here / 'models' / 'whisper' / model_size,
         ]
         if model_size.startswith('distil-'):
-            hf_folder = f'models--Systran--faster-distil-whisper-{model_size[7:]}'
+            repo = f'faster-distil-whisper-{model_size[7:]}'
         else:
-            hf_folder = f'models--Systran--faster-whisper-{model_size}'
-        hf_cache = (Path(os.environ.get('USERPROFILE', '~')).expanduser()
-                    / '.cache' / 'huggingface' / 'hub' / hf_folder)
-        return bundled, hf_cache
+            repo = f'faster-whisper-{model_size}'
+        roots.append(here / 'models' / 'whisper' / f'models--Systran--{repo}')
+        roots.append((Path(os.environ.get('USERPROFILE', '~')).expanduser()
+                      / '.cache' / 'huggingface' / 'hub'
+                      / f'models--Systran--{repo}'))
+        return roots
 
     def _update_whisper_path_status(self):
-        """Refresh the whisper-model path label: found vs. will-download."""
-        if not hasattr(self, 'whisper_model_var'):
+        """Refresh the whisper-model path label: found (where) vs. will-download."""
+        if not hasattr(self, 'whisper_path_label'):
             return
         model = self.whisper_model_var.get()
-        bundled, hf_cache = self._whisper_model_paths(model)
         found = None
-        for p in bundled:
-            if (p / 'model.bin').is_file() and (p / 'config.json').is_file():
-                found = p
-                break
-        if found is None:
-            if (hf_cache / 'model.bin').is_file() or list(hf_cache.rglob('model.bin')):
-                found = hf_cache
+        for root in self._whisper_model_paths(model):
+            try:
+                if (root / 'model.bin').is_file() and (root / 'config.json').is_file():
+                    found = root
+                    break
+                snaps = sorted(root.glob('snapshots/*'))
+                if snaps and (snaps[0] / 'model.bin').is_file():
+                    found = snaps[0]
+                    break
+            except OSError:
+                continue
         if found is not None:
             status = f'✅ {model}: found at {found}'
         else:
             status = (f'⚠️ {model}: not downloaded — will auto-download on '
                       f'first use (needs internet).')
-        lines = [status, f'   Checked: {bundled[0]}', f'             {hf_cache}']
-        self.whisper_path_label.config(text='\n'.join(lines))
+        self.whisper_path_label.config(text=status)
 
     def create_text_settings_tab(self):
         """Create Text Settings tab with horizontal grid layout"""
