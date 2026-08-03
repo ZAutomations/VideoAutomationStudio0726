@@ -1041,15 +1041,17 @@ def build_dubbed_audio(video_path: Path, out_mp3: Path, target_language: str,
     _cfg = settings.get('dub_translate_models')
     if isinstance(_cfg, str):
         _cfg = [m.strip() for m in _cfg.split(',') if m.strip()]
+    # Only IDs that exist in the current Gemini API (verified via the models
+    # endpoint). gemini-3.1-flash-preview / gemini-1.5-flash* are 404s, so a
+    # chain that includes them wastes one round-trip on EVERY run.
     model_chain = _cfg or [
         'gemini-2.5-flash',
-        'gemini-3.1-flash-preview',
+        'gemini-3.5-flash',
+        'gemini-3.1-flash-lite',
         'gemini-flash-latest',
         'gemini-2.0-flash',
         'gemini-flash-lite-latest',
         'gemini-2.0-flash-lite',
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-8b',
         'gemini-2.5-pro',
         'gemini-2.5-flash-lite',
     ]
