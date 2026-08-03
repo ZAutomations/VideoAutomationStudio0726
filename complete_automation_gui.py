@@ -1443,6 +1443,26 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                                    resolution=0.05,
                                    value_format=lambda v: f'{v:.2f}s')
 
+        # Skip already-processed (folder batch) — resume-friendly, mirrors the
+        # Dubbing tab's "skip already-dubbed" checkbox.
+        self.ss_skip_done_var = tk.BooleanVar(
+            value=bool(self.settings.get('silence_skip_done', True)))
+        def _on_skip_done_toggle():
+            self.update_setting('silence_skip_done', self.ss_skip_done_var.get())
+        ss_skip_row = tk.Frame(ss_card, bg=AppStyles.BG_INPUT)
+        ss_skip_row.pack(fill='x', pady=(8, 0))
+        tk.Checkbutton(ss_skip_row, text='Skip already-processed (folder batch)',
+                      variable=self.ss_skip_done_var,
+                      bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                      font=('Segoe UI', 9, 'bold'),
+                      activebackground=AppStyles.BG_INPUT,
+                      selectcolor=AppStyles.BG_INPUT,
+                      command=_on_skip_done_toggle).pack(anchor='w')
+        tk.Label(ss_skip_row,
+                 text='(leaves files that already have a SilenceRemoved output untouched)',
+                 bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic')).pack(anchor='w')
+
         # Button row
         ss_btn_row = tk.Frame(ss_card, bg=AppStyles.BG_INPUT)
         ss_btn_row.pack(fill='x', pady=(8, 0))
@@ -20384,6 +20404,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         # Read checkbox state BEFORE spawning thread (tkinter vars are not thread-safe)
         crossfade_enabled = self.ss_crossfade_var.get()
         trans_enabled = self.ss_trans_var.get()
+        skip_done = bool(self.ss_skip_done_var.get())
 
         trans_dur = 0.0
         use_tab = False
@@ -20409,15 +20430,23 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
 
         def _run():
             success_count = 0
+            skipped_count = 0
             try:
                 from youtube_video_automation_enhanced import remove_silence_from_video
                 ffmpeg_exe = self._find_ffmpeg()
 
                 for i, video_path in enumerate(videos):
+                    output_path = self._ss_output_path(video_path)
+                    if skip_done and output_path.is_file() \
+                            and output_path.stat().st_size > 0:
+                        skipped_count += 1
+                        logger.info(f'[SILENCE] Batch — skipping already processed: '
+                                    f'{video_path.name}')
+                        continue
+
                     self.ss_status_var.set(f'Processing {i+1}/{len(videos)}: {video_path.name}')
                     self.root.update()
 
-                    output_path = self._ss_output_path(video_path)
                     ok = remove_silence_from_video(video_path, output_path,
                                                    self.settings, ffmpeg_path=ffmpeg_exe,
                                                    transition_duration=trans_dur,
@@ -20426,12 +20455,14 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                         success_count += 1
 
                 _out_dir = folder / f'{folder.name}_SilenceRemoved'
+                _skip_txt = f', skipped {skipped_count} already done' if skipped_count else ''
                 self.ss_out_var.set(
                     f'Done! {success_count}/{len(videos)} processed → '
-                    f'{_out_dir}')
+                    f'{_out_dir}{_skip_txt}')
                 self.ss_status_var.set('Remove Silence')
                 messagebox.showinfo('Batch Complete',
-                    f'Processed {success_count}/{len(videos)} videos\n\n'
+                    f'Processed {success_count}/{len(videos)} videos'
+                    f'{_skip_txt}\n\n'
                     f'Output folder:\n{_out_dir}')
             except Exception as e:
                 logger.error(f'Batch silence removal error: {e}', exc_info=True)
