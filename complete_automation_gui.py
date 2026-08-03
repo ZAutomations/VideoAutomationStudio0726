@@ -20250,6 +20250,27 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
     # STANDALONE SILENCE REMOVAL FUNCTIONS
     # ═══════════════════════════════════════════════════════════
 
+    def _ss_output_path(self, video_path) -> Path:
+        """Where a silence-removed file is written — mirrors the Dubbing tab.
+
+        Creates a sibling subfolder named ``<parent-folder>_SilenceRemoved``
+        and keeps the **original filename** (no ``_nosilence`` suffix).
+
+        Example: ``videos/MyChannel/video.mp4`` →
+        ``videos/MyChannel/MyChannel_SilenceRemoved/video.mp4``
+        """
+        src = Path(video_path)
+        # The "channel name" is the source video's parent folder name (same
+        # rule the Dubbing tab uses for its ``<channel>_<lang>`` subfolders).
+        parent_name = src.parent.name
+        subfolder_name = f'{parent_name}_SilenceRemoved'
+        output_dir = src.parent / subfolder_name
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass  # will fail downstream if the dir is unwritable
+        return output_dir / src.name  # keep original filename
+
     def _ss_browse_video(self):
         """Browse for a single video or audio file for standalone silence removal"""
         video = filedialog.askopenfilename(
@@ -20260,8 +20281,8 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                        ('All Files', '*.*')])
         if video:
             self.ss_video_var.set(video)
-            # Show output path preview
-            out = Path(video).parent / f"{Path(video).stem}_nosilence{Path(video).suffix}"
+            # Show output path preview (Dubbing-style subfolder, original name)
+            out = self._ss_output_path(video)
             self.ss_out_var.set(f'Output: {out}')
             self.ss_status_var.set('')
             logger.info(f'Standalone silence removal media selected: {video}')
@@ -20271,7 +20292,9 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         folder = filedialog.askdirectory(title='Select Folder with Media Files')
         if folder:
             self.ss_video_var.set(folder)
-            self.ss_out_var.set(f'Batch: {folder}')
+            self.ss_out_var.set(
+                f'Batch: {folder}\nOutput → '
+                f'{folder}\\{Path(folder).name}_SilenceRemoved\\')
             self.ss_status_var.set('')
             logger.info(f'Standalone silence removal folder selected: {folder}')
 
@@ -20293,7 +20316,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
 
     def _ss_run_file(self, video_path: Path):
         """Run silence removal on a single video file"""
-        output_path = video_path.parent / f"{video_path.stem}_nosilence{video_path.suffix}"
+        output_path = self._ss_output_path(video_path)
 
         # Read checkbox states BEFORE spawning thread (tkinter vars are not thread-safe)
         crossfade_enabled = self.ss_crossfade_var.get()
@@ -20333,7 +20356,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     self.ss_out_var.set(f'Done! Saved: {output_path}')
                     self.ss_status_var.set('Remove Silence')
                     messagebox.showinfo('Success',
-                        f'Silence removed successfully!\\n\\n{output_path}')
+                        f'Silence removed successfully!\n\n{output_path}')
                 else:
                     self.ss_status_var.set('Remove Silence')
                     messagebox.showerror('Error', 'Silence removal failed. See console for details.')
@@ -20394,7 +20417,7 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     self.ss_status_var.set(f'Processing {i+1}/{len(videos)}: {video_path.name}')
                     self.root.update()
 
-                    output_path = folder / f"{video_path.stem}_nosilence{video_path.suffix}"
+                    output_path = self._ss_output_path(video_path)
                     ok = remove_silence_from_video(video_path, output_path,
                                                    self.settings, ffmpeg_path=ffmpeg_exe,
                                                    transition_duration=trans_dur,
@@ -20402,10 +20425,14 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                     if ok and output_path.is_file():
                         success_count += 1
 
-                self.ss_out_var.set(f'Done! {success_count}/{len(videos)} processed in: {folder}')
+                _out_dir = folder / f'{folder.name}_SilenceRemoved'
+                self.ss_out_var.set(
+                    f'Done! {success_count}/{len(videos)} processed → '
+                    f'{_out_dir}')
                 self.ss_status_var.set('Remove Silence')
                 messagebox.showinfo('Batch Complete',
-                    f'Processed {success_count}/{len(videos)} videos\\n\\nFolder: {folder}')
+                    f'Processed {success_count}/{len(videos)} videos\n\n'
+                    f'Output folder:\n{_out_dir}')
             except Exception as e:
                 logger.error(f'Batch silence removal error: {e}', exc_info=True)
                 self.ss_status_var.set('Error')
