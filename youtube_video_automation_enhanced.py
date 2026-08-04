@@ -15545,6 +15545,123 @@ def _is_audio_file(path: Path) -> bool:
     return path.suffix.lower() in _AUDIO_EXTS
 
 
+# Codecs MoviePy seeks 5-7x slower than H.264 (must re-decode from the
+# previous keyframe). AV1 YouTube downloads are the common case.
+_SLOW_SEEK_CODECS = {'av1', 'hevc', 'h265', 'vp9'}
+
+
+def _probe_video_codec(path, ffprobe) -> str | None:
+    """Return the source video codec name (lowercase), or None if unknown."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name', '-of', 'csv=p=0',
+             str(path)],
+            capture_output=True, text=True, timeout=30)
+        codec = (r.stdout.strip() or '').lower()
+        return codec or None
+    except Exception:
+        return None
+
+
+def _transcode_for_moviepy(video_path, ffmpeg, codec: str) -> Path | None:
+    """Transcode a slow-seek codec (AV1/HEVC/VP9) to a temp H.264 working copy.
+
+    MoviePy renders by seeking to each subclip start; AV1/HEVC/VP9 seeking is
+    5-7x slower than H.264 because the decoder must re-decode from the previous
+    keyframe. Transcoding ONCE (fast, sequential) makes the whole render run at
+    H.264 speed. Tries NVENC first (hardware), falls back to libx264. Original
+    audio is copied through untouched. Returns the temp path, or None on
+    failure (caller then falls back to the original file).
+    """
+    import os
+    import subprocess
+    import tempfile
+    _tmp = Path(tempfile.gettempdir()) / f'os_silence_{os.getpid()}_{codec}.mp4'
+    try:
+        _tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    def _encode(cmd: list) -> bool:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            return (r.returncode == 0 and _tmp.is_file()
+                    and _tmp.stat().st_size > 0)
+        except Exception:
+            return False
+
+    base = [ffmpeg, '-v', 'error', '-y', '-i', str(video_path),
+            '-c:a', 'copy', '-map', '0:v:0', '-map', '0:a:0?']
+    if _encode(base + ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23',
+                       str(_tmp)]):
+        return _tmp
+    if _encode(base + ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                       str(_tmp)]):
+        return _tmp
+    try:
+        _tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
+
+
+def _nvenc_available(ffmpeg) -> bool:
+    """True if this ffmpeg build includes the NVIDIA h264_nvenc encoder."""
+    import subprocess
+    try:
+        r = subprocess.run([ffmpeg, '-hide_banner', '-encoders'],
+                           capture_output=True, text=True, timeout=30)
+        return 'h264_nvenc' in (r.stdout + r.stderr)
+    except Exception:
+        return False
+
+
+def _ffmpeg_cut_concat(video_path, output_path, segments, ffmpeg, nvenc: bool) -> bool:
+    """Cut+stitch the keep-segments in ONE ffmpeg pass — the fast path.
+
+    MoviePy renders 1080p@50-60fps at only ~6 fps even from H.264, so a plain
+    silence-cut of a YouTube AV1 download can take 10+ minutes. This replaces
+    the whole MoviePy render for the no-transitions case: ffmpeg decodes the
+    source once and encodes once (NVENC when available) — roughly 20x faster,
+    same output. Uses the interleaved ``[vN][aN]`` concat filter (same pattern
+    as the Our Script length-crop).
+    """
+    import subprocess
+    n = len(segments)
+    if n == 0:
+        return False
+    parts = []
+    for i, (s, e) in enumerate(segments):
+        parts.append(f'[0:v]trim=start={s:.3f}:end={e:.3f},'
+                     f'setpts=PTS-STARTPTS[v{i}]')
+        parts.append(f'[0:a]atrim=start={s:.3f}:end={e:.3f},'
+                     f'asetpts=PTS-STARTPTS[a{i}]')
+    concat_in = ''.join(f'[v{i}][a{i}]' for i in range(n))
+    fc = ';'.join(parts) + f';{concat_in}concat=n={n}:v=1:a=1[v][a]'
+    if nvenc:
+        venc = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23']
+    else:
+        venc = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19']
+    cmd = [ffmpeg, '-v', 'error', '-y', '-i', str(video_path),
+           '-filter_complex', fc,
+           '-map', '[v]', '-map', '[a]'] + venc + ['-c:a', 'aac', '-b:a', '160k',
+                                                   str(output_path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except Exception as e:
+        print(f"[ERROR] remove_silence: ffmpeg cut+concat failed: {e}")
+        return False
+    if r.returncode != 0 or not output_path.is_file() \
+            or output_path.stat().st_size == 0:
+        print(f"[ERROR] remove_silence: ffmpeg cut+concat failed: "
+              f"{r.stderr[-300:] if r.stderr else 'no stderr'}")
+        return False
+    print(f"[SILENCE] ffmpeg fast cut+concat: {n} segment(s)")
+    return True
+
+
 def remove_silence_from_video(video_path: Path, output_path: Path,
                                settings: dict = None,
                                ffmpeg_path: str = None,
@@ -15670,14 +15787,53 @@ def remove_silence_from_video(video_path: Path, output_path: Path,
     print(f"[SILENCE] {duration_before:.1f}s → {duration_after:.1f}s "
           f"({len(segments)} segment(s), merged from {original_count})")
 
-    # ── Step 3: Cut and stitch with MoviePy ────────────────────────────
+    # ── Step 2.5: Fast path — plain cut+stitch in ONE ffmpeg pass ─────
+    # MoviePy renders 1080p@50-60fps at only ~6 fps (even from H.264), so a
+    # plain silence-cut of a YouTube AV1 download can take 10+ minutes. When
+    # no transitions/effects are requested, cut+concat directly with ffmpeg
+    # (NVENC encode when available) — ~20x faster, identical output.
     is_audio = _is_audio_file(video_path)
+    _want_transitions = (transition_duration is not None
+                         and transition_duration > 0 and len(segments) > 1)
+    if not is_audio and not _want_transitions:
+        if _ffmpeg_cut_concat(video_path, output_path, segments,
+                              _ffmpeg, _nvenc_available(_ffmpeg)):
+            print(f"[SILENCE] ✅ Saved: {output_path.name}")
+            return True
+        print("[SILENCE] ffmpeg fast path failed — falling back to MoviePy")
+
+    # ── Step 3: Cut and stitch with MoviePy ────────────────────────────
     try:
         from moviepy import VideoFileClip, concatenate_videoclips
         MOVIEPY2 = True
     except ImportError:
         from moviepy.editor import VideoFileClip, concatenate_videoclips
         MOVIEPY2 = False
+
+    # AV1/HEVC/VP9 sources seek 5-7x slower than H.264 in MoviePy (decoder
+    # re-decodes from the previous keyframe), so a silence-cut render of an
+    # AV1 YouTube download can take 5-7x longer than the identical H.264 file.
+    # Transcode such sources to a temp H.264 working copy ONCE (fast, NVENC)
+    # and run the whole MoviePy render on that — same output, H.264 speed.
+    working_path = video_path
+    _transcoded_tmp = None
+    if not is_audio:
+        try:
+            _src_codec = _probe_video_codec(str(video_path), _ffprobe)
+            if _src_codec in _SLOW_SEEK_CODECS:
+                _transcoded_tmp = _transcode_for_moviepy(
+                    video_path, _ffmpeg, _src_codec)
+                if _transcoded_tmp is not None:
+                    working_path = _transcoded_tmp
+                    print(f"[SILENCE] {_src_codec} source — transcoded to "
+                          f"H.264 working copy for fast rendering")
+                else:
+                    print(f"[WARNING] remove_silence: {_src_codec} transcode "
+                          f"failed; using original (may render slowly)")
+        except Exception as e:
+            print(f"[WARNING] remove_silence: transcode probe failed ({e}); "
+                  f"using original")
+            working_path = video_path
 
     try:
         if is_audio:
@@ -15687,7 +15843,7 @@ def remove_silence_from_video(video_path: Path, output_path: Path,
                 from moviepy.audio.io.AudioFileClip import AudioFileClip
             clip = AudioFileClip(str(video_path))
         else:
-            clip = VideoFileClip(str(video_path))
+            clip = VideoFileClip(str(working_path))
     except Exception as e:
         print(f"[ERROR] remove_silence: could not load {'audio' if is_audio else 'video'}: {e}")
         return False
@@ -16215,6 +16371,11 @@ def remove_silence_from_video(video_path: Path, output_path: Path,
         for sc in _sc:
             try:
                 sc.close()
+            except Exception:
+                pass
+        if _transcoded_tmp is not None:
+            try:
+                _transcoded_tmp.unlink(missing_ok=True)
             except Exception:
                 pass
 
