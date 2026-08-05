@@ -4578,6 +4578,298 @@ class LightLeaksEffects:
         return overlays
 
 
+def apply_enabled_effects_to_clip(clip, settings, log=None, apply_am=True):
+    """Apply the Cleanup-tab effect chain to a MoviePy clip and return it.
+
+    Replicates the frame effects the Cleanup render applies so other pipelines
+    (e.g. Dubbing) can produce the same viral look without re-implementing the
+    chain: Alight Motion template look (when one is selected), every enabled
+    start/end transition, and the light-leak / lens-flare / film-burn overlays
+    (composited on top).  Each step is wrapped so a single failing effect
+    degrades gracefully instead of killing the render.
+
+    ``log`` — optional ``(level, msg)`` callback; defaults to print.
+    ``apply_am`` — set False to skip the Alight Motion look even if a template
+    is selected (dubbing gates it behind its own checkbox).
+    """
+    def _noop(*a, **k):
+        pass
+    _log = log if log is not None else (lambda lv, msg: print(msg))
+    s = settings
+
+    # 0) Alight Motion template per-frame look (same per-frame callback the
+    #    main render uses, so the look is identical).
+    if apply_am and s.get('am_template', 'None') != 'None':
+        def _am_apply(get_frame, t):
+            return VideoEffects.apply_alight_motion_look(get_frame(t), s)
+        try:
+            clip = clip.transform(_am_apply)
+        except Exception:
+            try:
+                clip = clip.fl_image(_am_apply)
+            except Exception:
+                _log('warn', '[EFFECTS] Alight Motion look failed — skipping')
+
+    # 1) Enabled start/end transitions — same library the main render uses.
+    def _safe(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            _log('warn', f'[EFFECTS] transition skipped: {e}')
+            return None
+
+    if s.get('transition_fade_in', False):
+        d = float(s.get('transition_fade_in_duration', 0.5))
+        nc = _safe(TransitionEffects.apply_fade_transition, clip,
+                   fade_in_duration=d, fade_out_duration=0)
+        if nc is not None:
+            clip = nc
+    if s.get('transition_fade_out', False):
+        d = float(s.get('transition_fade_out_duration', 0.5))
+        nc = _safe(TransitionEffects.apply_fade_transition, clip,
+                   fade_in_duration=0, fade_out_duration=d)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_zoom_in', False):
+        d = float(s.get('transition_zoom_in_duration', 1.0))
+        sc = float(s.get('transition_zoom_scale', 1.3))
+        nc = _safe(TransitionEffects.create_zoom_transition, clip,
+                   zoom_in=True, duration=d, zoom_scale=sc)
+        if nc is not None:
+            clip = nc
+    if s.get('transition_zoom_out', False):
+        d = float(s.get('transition_zoom_out_duration', 1.0))
+        sc = float(s.get('transition_zoom_scale', 1.3))
+        nc = _safe(TransitionEffects.create_zoom_transition, clip,
+                   zoom_in=False, duration=d, zoom_scale=sc)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_blur_in', False):
+        d = float(s.get('transition_blur_duration', 0.5))
+        mb = int(s.get('transition_blur_amount', 15))
+        nc = _safe(TransitionEffects.create_blur_transition, clip,
+                   blur_in=True, duration=d, max_blur=mb)
+        if nc is not None:
+            clip = nc
+    if s.get('transition_blur_out', False):
+        d = float(s.get('transition_blur_duration', 0.5))
+        mb = int(s.get('transition_blur_amount', 15))
+        nc = _safe(TransitionEffects.create_blur_transition, clip,
+                   blur_in=False, duration=d, max_blur=mb)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_slide_in', False):
+        d = float(s.get('transition_slide_duration', 0.8))
+        direction = s.get('transition_slide_direction', 'left')
+        nc = _safe(TransitionEffects.create_slide_transition, clip,
+                   direction=direction, in_transition=True, duration=d)
+        if nc is not None:
+            clip = nc
+    if s.get('transition_slide_out', False):
+        d = float(s.get('transition_slide_duration', 0.8))
+        direction = s.get('transition_slide_direction', 'left')
+        nc = _safe(TransitionEffects.create_slide_transition, clip,
+                   direction=direction, in_transition=False, duration=d)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_wipe_in', False):
+        d = float(s.get('transition_wipe_duration', 0.8))
+        direction = s.get('transition_wipe_direction', 'right')
+        nc = _safe(TransitionEffects.create_wipe_transition, clip,
+                   direction=direction, in_transition=True, duration=d)
+        if nc is not None:
+            clip = nc
+    if s.get('transition_wipe_out', False):
+        d = float(s.get('transition_wipe_duration', 0.8))
+        direction = s.get('transition_wipe_direction', 'right')
+        nc = _safe(TransitionEffects.create_wipe_transition, clip,
+                   direction=direction, in_transition=False, duration=d)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_glitch_start', False):
+        d = float(s.get('transition_glitch_duration', 0.5))
+        intensity_g = float(s.get('transition_glitch_intensity', 0.5))
+        nc = _safe(TransitionEffects.create_glitch_transition, clip,
+                   glitch_start=True, duration=d, intensity=intensity_g)
+        if nc is not None:
+            clip = nc
+    if s.get('transition_glitch_end', False):
+        d = float(s.get('transition_glitch_duration', 0.5))
+        intensity_g = float(s.get('transition_glitch_intensity', 0.5))
+        nc = _safe(TransitionEffects.create_glitch_transition, clip,
+                   glitch_start=False, duration=d, intensity=intensity_g)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_cinematic_bars', False):
+        d = float(s.get('transition_bars_duration', 0.8))
+        bh = int(s.get('transition_bars_height', 10))
+        nc = _safe(TransitionEffects.create_cinematic_bars, clip,
+                   fade_in=True, duration=d, bar_height_percent=bh)
+        if nc is not None:
+            clip = nc
+
+    if s.get('transition_bounce', False):
+        d = float(s.get('transition_bounce_duration', 0.6))
+        h = float(s.get('transition_bounce_height', 0.30))
+        clip = _safe(TransitionEffects.create_bounce_transition, clip,
+                     duration=d, height=h, bounce_start=True) or clip
+        clip = _safe(TransitionEffects.create_bounce_transition, clip,
+                     duration=d, height=h, bounce_start=False) or clip
+
+    if s.get('transition_mask', False):
+        d = float(s.get('transition_mask_duration', 0.6))
+        shape = s.get('transition_mask_shape', 'circle')
+        mask_color = s.get('transition_mask_color', 'black')
+        clip = _safe(TransitionEffects.create_mask_reveal, clip,
+                     duration=d, shape=shape, direction='in',
+                     mask_start=True, bg_color=mask_color) or clip
+        clip = _safe(TransitionEffects.create_mask_reveal, clip,
+                     duration=d, shape=shape, direction='out',
+                     mask_start=False, bg_color=mask_color) or clip
+
+    if s.get('transition_bounce_mask', False):
+        d = float(s.get('transition_bounce_mask_duration', 0.8))
+        h = float(s.get('transition_bounce_height', 0.25))
+        shape = s.get('transition_mask_shape', 'circle')
+        mask_color = s.get('transition_mask_color', 'black')
+        clip = _safe(TransitionEffects.create_bounce_mask_transition, clip,
+                     duration=d, height=h, shape=shape,
+                     mask_start=True, bg_color=mask_color) or clip
+        clip = _safe(TransitionEffects.create_bounce_mask_transition, clip,
+                     duration=d, height=h, shape=shape,
+                     mask_start=False, bg_color=mask_color) or clip
+
+    if s.get('transition_radial_wipe', False):
+        try:
+            direction = s.get('transition_radial_wipe_direction', 'out')
+            duration = float(s.get('transition_radial_wipe_duration', 1.0))
+            nc = _safe(TransitionEffects.create_radial_wipe, clip,
+                       direction=direction, duration=duration)
+            if nc is not None:
+                clip = nc
+        except Exception as e:
+            _log('warn', f'[EFFECTS] radial wipe: {e}')
+
+    if s.get('transition_color_dissolve', False):
+        try:
+            direction = s.get('transition_color_dissolve_direction', 'in')
+            duration = float(s.get('transition_color_dissolve_duration', 0.8))
+            color = s.get('transition_color_dissolve_color', '#FFFFFF')
+            nc = _safe(TransitionEffects.create_color_dissolve, clip,
+                       direction=direction, duration=duration, color=color)
+            if nc is not None:
+                clip = nc
+        except Exception as e:
+            _log('warn', f'[EFFECTS] color dissolve: {e}')
+
+    if s.get('transition_split_wipe', False):
+        try:
+            direction = s.get('transition_split_wipe_direction', 'horizontal')
+            duration = float(s.get('transition_split_wipe_duration', 1.0))
+            nc = _safe(TransitionEffects.create_split_wipe, clip,
+                       direction=direction, in_transition=True, duration=duration)
+            if nc is not None:
+                clip = nc
+        except Exception as e:
+            _log('warn', f'[EFFECTS] split wipe: {e}')
+
+    if s.get('transition_luma_wipe', False):
+        try:
+            direction = s.get('transition_luma_wipe_direction', 'in')
+            duration = float(s.get('transition_luma_wipe_duration', 0.8))
+            nc = _safe(TransitionEffects.create_luma_wipe, clip,
+                       direction=direction, duration=duration)
+            if nc is not None:
+                clip = nc
+        except Exception as e:
+            _log('warn', f'[EFFECTS] luma wipe: {e}')
+
+    # 2) Light-leak / lens-flare / film-burn overlays, composited on top.
+    overlays = []
+    w, h = clip.w, clip.h
+    fps = getattr(clip, 'fps', 30) or 30
+    _cdur = float(clip.duration or 0)
+
+    def _build_repeats(kind, repeat_enabled, start_time, duration,
+                       interval, build_one):
+        if not repeat_enabled:
+            return [build_one(start_time)]
+        items, ct = [], start_time
+        while ct < _cdur:
+            try:
+                items.append(build_one(ct))
+            except Exception as e:
+                _log('warn', f'[EFFECTS] {kind}: {e}')
+            ct += interval
+        return items
+
+    if s.get('light_leak_enabled', False):
+        try:
+            color = s.get('light_leak_color', 'warm')
+            intensity = float(s.get('light_leak_intensity', 0.6))
+            start_time = float(s.get('light_leak_start_time', 0.0))
+            leak_duration = float(s.get('light_leak_duration', 3.0))
+            direction = s.get('light_leak_direction', 'top_right')
+            repeat_enabled = s.get('light_leak_repeat_enabled', False)
+            repeat_interval = float(s.get('light_leak_repeat_interval', 8.0))
+            overlays += _build_repeats(
+                'light leak', repeat_enabled, start_time, leak_duration,
+                repeat_interval,
+                lambda ct: LightLeaksEffects.create_light_leak(
+                    w, h, _cdur, fps, color=color, intensity=intensity,
+                    start_time=ct, leak_duration=leak_duration,
+                    direction=direction))
+        except Exception as e:
+            _log('warn', f'[EFFECTS] light leak: {e}')
+
+    if s.get('lens_flare_enabled', False):
+        try:
+            intensity = float(s.get('lens_flare_intensity', 0.5))
+            start_time = float(s.get('lens_flare_start_time', 1.0))
+            flare_duration = float(s.get('lens_flare_duration', 2.0))
+            position = s.get('lens_flare_position', 'center')
+            repeat_enabled = s.get('lens_flare_repeat_enabled', False)
+            repeat_interval = float(s.get('lens_flare_repeat_interval', 5.0))
+            overlays += _build_repeats(
+                'lens flare', repeat_enabled, start_time, flare_duration,
+                repeat_interval,
+                lambda ct: LightLeaksEffects.create_lens_flare(
+                    w, h, _cdur, fps, intensity=intensity, start_time=ct,
+                    flare_duration=flare_duration, position=position))
+        except Exception as e:
+            _log('warn', f'[EFFECTS] lens flare: {e}')
+
+    if s.get('film_burn_enabled', False):
+        try:
+            start_time = float(s.get('film_burn_start_time', 0.0))
+            burn_duration = float(s.get('film_burn_duration', 1.5))
+            repeat_enabled = s.get('film_burn_repeat_enabled', False)
+            repeat_interval = float(s.get('film_burn_repeat_interval', 10.0))
+            overlays += _build_repeats(
+                'film burn', repeat_enabled, start_time, burn_duration,
+                repeat_interval,
+                lambda ct: LightLeaksEffects.create_film_burn(
+                    w, h, _cdur, fps, start_time=ct, burn_duration=burn_duration))
+        except Exception as e:
+            _log('warn', f'[EFFECTS] film burn: {e}')
+
+    if overlays:
+        try:
+            from moviepy import CompositeVideoClip
+            clip = CompositeVideoClip([clip] + overlays)
+            _log('info', f'[EFFECTS] composited {len(overlays)} overlay clip(s)')
+        except Exception as e:
+            _log('warn', f'[EFFECTS] overlay composite failed: {e}')
+
+    return clip
+
+
 class ParticleEffects:
     """Particle effects for viral videos (glitter, stars, hearts, confetti)"""
 

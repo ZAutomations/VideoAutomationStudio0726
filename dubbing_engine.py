@@ -27,8 +27,10 @@ Public API
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import functools
 from pathlib import Path
 
 SAMPLE_RATE = 44100
@@ -960,7 +962,8 @@ def transcribe_video(video_path: Path, settings: dict, log=None,
 
 def build_dubbed_audio(video_path: Path, out_mp3: Path, target_language: str,
                        settings: dict, log=None, progress=None,
-                       source_language: str | None = None):
+                       source_language: str | None = None,
+                       captions_out: list | None = None):
     """Produce a full-length dubbed audio track as an MP3.
 
     The original audio is kept as a low background bed and ducked further
@@ -968,6 +971,10 @@ def build_dubbed_audio(video_path: Path, out_mp3: Path, target_language: str,
     original timing.  Returns the MP3 Path, or ``None`` on failure.
 
     ``progress(done, total, note)`` — optional callback for UI updates.
+    ``captions_out`` — optional list; each successfully voiced line appends
+    ``{'text': <translated>, 'start': s, 'end': e}`` (seconds) matching exactly
+    where the dubbed audio plays, so callers can burn target-language captions
+    synced to the new voice track.
     """
     import numpy as np
     import soundfile as sf
@@ -1245,6 +1252,17 @@ def build_dubbed_audio(video_path: Path, out_mp3: Path, target_language: str,
             ducked[_seg_slice] = True
         track[_seg_slice] += data
         placed += 1
+        if captions_out is not None:
+            # Caption window = exactly where the dubbed audio plays (anchored at
+            # the original timestamp, ending at the placed audio after any
+            # fit-to-slot stretch), plus a short tail so the text lingers a
+            # beat.  Uses the translated text, i.e. captions match the new voice.
+            _t0 = start / float(SAMPLE_RATE)
+            _t1 = min((end + int(0.2 * SAMPLE_RATE)) / float(SAMPLE_RATE),
+                      total_samples / float(SAMPLE_RATE))
+            if _t1 - _t0 < 0.6:
+                _t1 = _t0 + 0.6
+            captions_out.append({'text': txt, 'start': _t0, 'end': _t1})
         prog(i + 1, len(segments), f'Voicing {i + 1}/{len(segments)}')
 
 
@@ -1308,29 +1326,122 @@ def dub_video(video_path: Path, out_video: Path, target_language: str,
         log('warn', f'Dub: could not validate input video ({e}) — continuing')
 
     dub_mp3 = out_video.with_suffix('.dub.mp3')
+    captions = [] if settings.get('dub_burn_captions') else None
     result = build_dubbed_audio(
         video_path, dub_mp3, target_language, settings, log, progress,
-        source_language)
+        source_language, captions_out=captions)
     if result is None:
         return None
 
-    log('info', f'Dub: muxing dubbed audio into {out_video.name} …')
+    # ══ Output assembly: effects → captions → plain mux ═════════════════
+    # Three paths, in priority order:
+    #   1) Effects (AM template / enabled transitions) → MoviePy render.
+    #   2) Captions only → ffmpeg ASS burn (re-encode).
+    #   3) Plain → copy video stream + replace audio.
+    # Any failure falls through to the next-lighter path rather than aborting.
+    _apply_am = bool(settings.get('dub_apply_am', False)) \
+        and settings.get('am_template', 'None') != 'None'
+    _inc_trans = bool(settings.get('dub_include_transitions', False)) \
+        and bool(_enabled_transition_keys(settings))
+    _want_effects = _apply_am or _inc_trans
+
+    _mux_ok = False
     try:
-        # NOTE: no ``-shortest`` — the dubbed track can legitimately run a beat
-        # past the video (a long final Urdu line), and -shortest would chop that
-        # tail, cutting off the last word.  Video stream is copied untouched;
-        # the container simply lasts as long as the longer stream (the audio),
-        # so the last word always plays out.
-        subprocess.run(
-            ['ffmpeg', '-y', '-i', str(video_path), '-i', str(dub_mp3),
-             '-map', '0:v:0', '-map', '1:a:0',
-             '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
-             str(out_video)],
-            capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        _err = (e.stderr or b'').decode('utf-8', errors='replace')[-400:]
-        log('error', f'Dub: mux failed — {_err}')
-        return None
+        # 1) Effects render (MoviePy) — optionally with captions on top.
+        if _want_effects:
+            log('info', 'Dub: applying Alight Motion template / transitions '
+                        '(re-render)…')
+            _eff_tmp = None
+            _eff_out = out_video
+            if captions:
+                # Render to a temp intermediate so the caption burn below can
+                # read it in and write out_video (never read+write same file).
+                _eff_tmp = out_video.with_suffix('.dub.effects.mp4')
+                _eff_out = _eff_tmp
+            try:
+                _render_dub_with_effects(video_path, dub_mp3, _eff_out,
+                                         settings, log)
+                _mux_ok = True
+                if captions:
+                    log('info',
+                        f'Dub: burning {len(captions)} translated caption(s) …')
+                    try:
+                        _w, _h = _probe_video_dims(_eff_out)
+                        _w, _h = _w or 1080, _h or 1920
+                        _ass = out_video.with_suffix('.dub.captions.ass')
+                        try:
+                            _write_dub_ass(_ass, captions, settings, _w, _h)
+                            _burn_captions_on_video(_eff_out, out_video,
+                                                    _ass, log)
+                        finally:
+                            try:
+                                _ass.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log('warn',
+                            f'Dub: caption burn on effects output failed ({e}) '
+                            '— captions skipped')
+                        # Keep the effects render as the final output when it
+                        # exists; otherwise fall through to a lighter path.
+                        try:
+                            if _eff_tmp is not None and _eff_tmp.is_file():
+                                _eff_tmp.replace(out_video)
+                                _mux_ok = True
+                            else:
+                                _mux_ok = False
+                        except Exception:
+                            _mux_ok = False
+            except Exception as e:
+                log('warn', f'Dub: effects render failed ({e}) — falling back')
+                _mux_ok = False
+            finally:
+                if _eff_tmp is not None:
+                    try:
+                        _eff_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        # 2) Captions only → ASS burn (re-encode).
+        if not _mux_ok and captions:
+            log('info', f'Dub: burning {len(captions)} translated caption(s) …')
+            try:
+                _w, _h = _probe_video_dims(video_path)
+                _w, _h = _w or 1080, _h or 1920
+                _ass = out_video.with_suffix('.dub.captions.ass')
+                try:
+                    _write_dub_ass(_ass, captions, settings, _w, _h)
+                    _burn_dub_captions(video_path, dub_mp3, out_video, _ass,
+                                       settings, log)
+                    _mux_ok = True
+                finally:
+                    try:
+                        _ass.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log('warn',
+                    f'Dub: caption burn failed ({e}) — falling back to plain mux')
+
+        # 3) Plain copy-mux.
+        if not _mux_ok:
+            log('info', f'Dub: muxing dubbed audio into {out_video.name} …')
+            try:
+                # NOTE: no ``-shortest`` — the dubbed track can legitimately run
+                # a beat past the video (a long final Urdu line), and -shortest
+                # would chop that tail, cutting off the last word.  Video stream
+                # is copied untouched; the container simply lasts as long as the
+                # longer stream (the audio), so the last word always plays out.
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', str(video_path), '-i', str(dub_mp3),
+                     '-map', '0:v:0', '-map', '1:a:0',
+                     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                     str(out_video)],
+                    capture_output=True, check=True)
+                _mux_ok = True
+            except subprocess.CalledProcessError as e:
+                _err = (e.stderr or b'').decode('utf-8', errors='replace')[-400:]
+                log('error', f'Dub: mux failed — {_err}')
     finally:
         if not keep_audio_file:
             try:
@@ -1338,5 +1449,279 @@ def dub_video(video_path: Path, out_video: Path, target_language: str,
             except Exception:
                 pass
 
+    if not _mux_ok:
+        return None
+
     log('ok', f'Dub: ✅ dubbed video written → {out_video}')
     return out_video
+
+
+# ── Translated-caption burn (ASS overlay) ────────────────────────────────
+# When "Burn translated captions" is on, the dubbed output is re-encoded with
+# an ASS subtitle overlay instead of a plain video-copy mux.  Styling is pulled
+# from the existing caption settings so the dub captions match the tool's other
+# captions.
+
+@functools.lru_cache(maxsize=1)
+def _nvenc_available():
+    """True if this ffmpeg build exposes h264_nvenc (NVIDIA GPU), cached."""
+    try:
+        _r = subprocess.run(['ffmpeg', '-encoders'],
+                            capture_output=True, text=True, timeout=5)
+        return 'h264_nvenc' in _r.stdout
+    except Exception:
+        return False
+
+
+# Setting keys, in stable order, for every transition the Transitions tab can
+# enable — mirrors _get_enabled_transition_keys in the GUI so the dub knows
+# whether "include transitions" actually has anything to apply.
+_TRANSITION_ORDER = [
+    'transition_fade_in', 'transition_fade_out',
+    'transition_zoom_in', 'transition_zoom_out',
+    'transition_blur_in', 'transition_blur_out',
+    'transition_slide_in', 'transition_slide_out',
+    'transition_wipe_in', 'transition_wipe_out',
+    'transition_glitch_start', 'transition_glitch_end',
+    'transition_cinematic_bars',
+    'lens_flare_enabled', 'light_leak_enabled', 'film_burn_enabled',
+    'transition_bounce', 'transition_mask', 'transition_bounce_mask',
+    'transition_radial_wipe', 'transition_color_dissolve',
+    'transition_split_wipe', 'transition_luma_wipe',
+]
+
+
+def _enabled_transition_keys(settings: dict) -> list:
+    """Return the transition keys currently enabled in settings."""
+    return [k for k in _TRANSITION_ORDER if settings.get(k, False)]
+
+
+def _probe_video_dims(video_path: Path):
+    """Return (width, height) of the first video stream, or (None, None)."""
+    try:
+        _r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0',
+             str(video_path)],
+            capture_output=True, text=True)
+        _dim = (_r.stdout or '').strip()
+        if 'x' in _dim:
+            _w, _h = _dim.split('x', 1)
+            return int(_w), int(_h)
+    except Exception:
+        pass
+    return None, None
+
+
+def _css_hex_to_ass(c: str) -> str:
+    """Convert '#RRGGBB' → ASS color '&HAABBGGRR' (opaque alpha)."""
+    c = (c or '#FFFFFF').strip().lstrip('#')
+    if len(c) == 3:
+        c = ''.join(ch * 2 for ch in c)
+    try:
+        r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    except Exception:
+        r, g, b = 255, 255, 255
+    return f'&H00{b:02X}{g:02X}{r:02X}'
+
+
+def _font_family_from_file(font_file) -> str | None:
+    """Best-effort family name for a font file (for ASS font lookup)."""
+    try:
+        from PIL import ImageFont
+        if font_file and Path(str(font_file)).is_file():
+            _n = ImageFont.truetype(str(font_file), 40).getname()
+            if _n and _n[0]:
+                return _n[0]
+    except Exception:
+        pass
+    return None
+
+
+def _write_dub_ass(ass_path: Path, captions: list, settings: dict,
+                   w: int, h: int):
+    """Write an ASS subtitle file for translated dub captions.
+
+    One Dialogue event per line; each window is exactly where the dubbed audio
+    plays.  Styled from the caption settings (font file/size, colors, bg box,
+    position) so the dub captions look like the tool's other captions.
+    """
+    _ff = settings.get('caption_highlight_font_file',
+                       'C:/Windows/Fonts/arialbd.ttf')
+    fam = _font_family_from_file(_ff) or settings.get(
+        'caption_font_style', 'Arial') or 'Arial'
+    fam = str(fam).split(',')[0].strip() or 'Arial'
+
+    _fs = int(settings.get('caption_font_size', 60) or 60)
+    fs = max(12, int(_fs * h / 1920.0)) if h else _fs
+
+    fg = _css_hex_to_ass(str(settings.get('caption_highlight_color', '#FFFFFF')))
+    stroke = _css_hex_to_ass(str(settings.get('caption_stroke_color', '#000000')))
+    box = _css_hex_to_ass(
+        str(settings.get('caption_active_stroke_color', '#FF1493')))
+    # caption_bg_opacity is stored inconsistently (0..1 in the renderer,
+    # 0..255 in the GUI slider) — normalize, then to an ASS alpha byte
+    # (00=opaque, FF=transparent).
+    try:
+        _op = float(settings.get('caption_bg_opacity', 0.7) or 0.7)
+    except Exception:
+        _op = 0.7
+    if _op > 1.0:
+        _op = _op / 255.0
+    _box_a = max(0, min(255, int(round(255 * _op))))
+    box_color = f'&H{255 - _box_a:02X}{box[4:]}'   # box[4:] = BBGGRR (6 chars)
+
+    pos = str(settings.get('caption_position', 'bottom'))
+    align = 8 if pos == 'top' else 2
+    try:
+        y_off = int(settings.get('caption_y_offset', 0) or 0)
+    except Exception:
+        y_off = 0
+
+    def _ts(s):
+        return (f'{int(s // 3600)}:{int(s % 3600 // 60):02d}:{s % 60:05.2f}')
+
+    lines = [
+        '[Script Info]',
+        'ScriptType: v4.00+',
+        f'PlayResX: {w}',
+        f'PlayResY: {h}',
+        'WrapStyle: 0',
+        '',
+        '[V4+ Styles]',
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, '
+        'OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, '
+        'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
+        'Alignment, MarginL, MarginR, MarginV, Encoding',
+        f'Style: Dub,{fam},{fs},{fg},{fg},{stroke},{box_color},-1,0,0,0,'
+        f'100,100,0,0,3,2,0,{align},30,30,{40 + y_off},1',
+        '',
+        '[Events]',
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, '
+        'Effect, Text',
+    ]
+    for c in captions:
+        _txt = (c.get('text') or '').replace('{', '(').replace('}', ')')
+        _txt = _txt.replace('\n', r'\N').replace('\\', r'\\')
+        lines.append(
+            f'Dialogue: 0,{_ts(c["start"])},{_ts(c["end"])},Dub,,0,0,0,,{_txt}')
+    ass_path.write_text('\n'.join(lines) + '\n', encoding='utf-8-sig')
+
+
+def _burn_dub_captions(video_path: Path, dub_mp3: Path, out_video: Path,
+                       ass_path: Path, settings: dict, log):
+    """Re-encode video with the ASS caption overlay + dubbed audio, one pass.
+
+    NVENC when available, libx264 otherwise.  Raises on failure — the caller
+    falls back to the plain copy-mux.
+    """
+    _p = str(ass_path).replace('\\', '/')
+    _p = re.sub(r'([:])', r'\\\1', _p)   # D:/… -> D\:/… (escape drive colon)
+    # ffmpeg's filter parser splits options on ':' and ',', so the filename must
+    # be single-quoted AND the drive-letter colon escaped. Verified against real
+    # ffmpeg: ass=filename='D\:/tmp/x.ass' is the working form on Windows.
+    vf = f"ass=filename='{_p}',format=yuv420p"
+    if _nvenc_available():
+        _v = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23',
+              '-pix_fmt', 'yuv420p']
+    else:
+        _v = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+              '-pix_fmt', 'yuv420p', '-threads', '0']
+    _r = subprocess.run(
+        ['ffmpeg', '-y', '-i', str(video_path), '-i', str(dub_mp3),
+         '-vf', vf, '-map', '0:v:0', '-map', '1:a:0',
+         '-c:a', 'aac', '-b:a', '192k', *_v, str(out_video)],
+        capture_output=True)
+    if _r.returncode != 0:
+        _err = (_r.stderr or b'').decode('utf-8', errors='replace')[-400:]
+        raise RuntimeError(_err)
+    log('ok', 'Dub: ✅ captions burned (video re-encoded)')
+
+
+def _burn_captions_on_video(video_path: Path, out_video: Path,
+                            ass_path: Path, log):
+    """Re-encode an already-assembled video with the ASS caption overlay,
+    PRESERVING its existing audio track (used after the effects render, which
+    already carries the dubbed audio).  Raises on failure.
+    """
+    _p = str(ass_path).replace('\\', '/')
+    _p = re.sub(r'([:])', r'\\\1', _p)
+    vf = f"ass=filename='{_p}',format=yuv420p"
+    if _nvenc_available():
+        _v = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23',
+              '-pix_fmt', 'yuv420p']
+    else:
+        _v = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+              '-pix_fmt', 'yuv420p', '-threads', '0']
+    _r = subprocess.run(
+        ['ffmpeg', '-y', '-i', str(video_path),
+         '-vf', vf, '-map', '0:v:0', '-map', '0:a:0?',
+         '-c:a', 'copy', *_v, str(out_video)],
+        capture_output=True)
+    if _r.returncode != 0:
+        _err = (_r.stderr or b'').decode('utf-8', errors='replace')[-400:]
+        raise RuntimeError(_err)
+
+
+def _render_dub_with_effects(video_path: Path, dub_mp3: Path, out_video: Path,
+                             settings: dict, log):
+    """Re-render the dubbed video through the Cleanup effect chain (Alight
+    Motion look + enabled transitions + overlays) with the dubbed track as
+    audio — the "Apply AM template / Include transitions" dubbing feature.
+
+    MoviePy per-frame render (like Cleanup), so this is the slow path; only
+    taken when the user enables the effects.  Raises on failure so the caller
+    can fall back to the plain mux.
+    """
+    try:
+        from youtube_video_automation_enhanced import (
+            apply_enabled_effects_to_clip)
+    except Exception as e:
+        raise RuntimeError(f'could not import effect chain ({e})')
+
+    from moviepy import AudioFileClip, VideoFileClip
+
+    clip = VideoFileClip(str(video_path))
+    try:
+        clip = apply_enabled_effects_to_clip(clip, settings, log=log)
+        audio = AudioFileClip(str(dub_mp3))
+        try:
+            clip = clip.with_audio(audio)
+        except Exception:
+            clip = clip.set_audio(audio)
+        # The dubbed track can run a beat past the video (long final line).
+        # Extend the clip so the last word isn't cut off; the final video
+        # frame freezes for the extra tail.
+        _adur = float(audio.duration or 0)
+        _vdur = float(clip.duration or 0)
+        if _adur > _vdur:
+            try:
+                clip = clip.with_duration(_adur)
+            except Exception:
+                pass
+        _fps = int(getattr(clip, 'fps', 30) or 30)
+        _ff = ['-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+               '-map_metadata', '-1']
+        if _nvenc_available():
+            log('info', 'Dub: effects render — NVENC encode')
+            clip.write_videofile(
+                str(out_video), codec='h264_nvenc', audio_codec='aac',
+                fps=_fps, preset='p5',
+                ffmpeg_params=['-rc', 'vbr', '-cq', '23', *_ff],
+                logger=None)
+        else:
+            log('info', 'Dub: effects render — libx264 encode')
+            clip.write_videofile(
+                str(out_video), codec='libx264', audio_codec='aac',
+                fps=_fps, preset='fast', threads=2,
+                ffmpeg_params=_ff, logger=None)
+    finally:
+        try:
+            clip.close()
+        except Exception:
+            pass
+        try:
+            audio.close()
+        except Exception:
+            pass
+    log('ok', 'Dub: ✅ effects render done (AM look + transitions)')

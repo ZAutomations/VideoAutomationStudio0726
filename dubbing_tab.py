@@ -522,7 +522,99 @@ class DubbingTabMixin:
                        command=lambda: self.update_setting(
                            'dub_keep_audio_file',
                            self._dub_keep_audio_var.get())).pack(
-                               anchor='w', padx=8, pady=(2, 6))
+                               anchor='w', padx=8, pady=(2, 0))
+
+        # Burn translated captions onto the dubbed video ------------------
+        self._dub_burn_captions_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_burn_captions', True)))
+        tk.Checkbutton(opt_card,
+                       text='Burn translated captions on the dubbed video',
+                       variable=self._dub_burn_captions_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT,
+                       font=('Segoe UI', 8),
+                       command=lambda: self.update_setting(
+                           'dub_burn_captions',
+                           self._dub_burn_captions_var.get())).pack(
+                               anchor='w', padx=8, pady=(2, 0))
+        tk.Label(opt_card,
+                 text='   Shows the translated text (dubbed language) synced to '
+                      'the new voice, styled from your caption settings. Re-encodes '
+                      'the video, so the output becomes H.264.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), justify='left',
+                 wraplength=500).pack(anchor='w', padx=8, pady=(0, 6))
+
+        # Alight Motion template status (set in Quick Process tab) ----------
+        am_card = self._dub_card(scrollable,
+                                 'Alight Motion Template (set in Quick Process)')
+        am_body = tk.Frame(am_card, bg=AppStyles.BG_CARD)
+        am_body.pack(fill='x', padx=8, pady=(2, 8))
+
+        self._dub_am_status_var = tk.StringVar()
+        self._dub_refresh_am_status()
+        tk.Label(am_body, textvariable=self._dub_am_status_var,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.ACCENT_PRIMARY,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+        tk.Label(am_body,
+                 text='   The Alight Motion look is selected in the Quick '
+                      'Process > Alight Motion Look Builder card.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), wraplength=520,
+                 justify='left').pack(anchor='w', pady=(2, 0))
+
+        self._dub_apply_am_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_apply_am', False)))
+        tk.Checkbutton(am_body,
+                       text='Apply the Alight Motion template to the dubbed video',
+                       variable=self._dub_apply_am_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT,
+                       font=('Segoe UI', 8),
+                       command=lambda: self.update_setting(
+                           'dub_apply_am',
+                           self._dub_apply_am_var.get())).pack(
+                               anchor='w', pady=(4, 0))
+        tk.Label(am_body,
+                 text='   Re-renders the video with the AM look applied on top '
+                      'of the dub (output becomes H.264).',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), wraplength=520,
+                 justify='left').pack(anchor='w')
+
+        # Include transitions from Transitions tab --------------------------
+        trans_card = self._dub_card(scrollable,
+                                    'Include Transitions from Transitions Tab')
+        trans_body = tk.Frame(trans_card, bg=AppStyles.BG_CARD)
+        trans_body.pack(fill='x', padx=8, pady=(2, 8))
+
+        self._dub_include_transitions_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_include_transitions', False)))
+        tk.Checkbutton(trans_body,
+                       text='Apply enabled transitions to the dubbed video',
+                       variable=self._dub_include_transitions_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT,
+                       font=('Segoe UI', 8),
+                       command=lambda: self.update_setting(
+                           'dub_include_transitions',
+                           self._dub_include_transitions_var.get())).pack(
+                               anchor='w', pady=(2, 0))
+
+        self._dub_trans_summary_var = tk.StringVar()
+        self._dub_refresh_trans_summary()
+        tk.Label(trans_body, textvariable=self._dub_trans_summary_var,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), wraplength=520,
+                 justify='left').pack(anchor='w', pady=(4, 0))
+        tk.Button(trans_body, text='Refresh transition list',
+                  command=self._dub_refresh_trans_summary,
+                  bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                  font=('Segoe UI', 8), padx=10, pady=2).pack(
+                      anchor='w', pady=(6, 0))
 
         # ── 4) Run button + progress ───────────────────────────────────
         run_row = tk.Frame(scrollable, bg=AppStyles.BG_CARD)
@@ -713,6 +805,59 @@ class DubbingTabMixin:
                  fg=AppStyles.ACCENT_PRIMARY,
                  font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=8, pady=(6, 0))
         return card
+
+    def _dub_refresh_am_status(self):
+        """Show which Alight Motion template is currently selected (it is
+        driven from the Quick Process > Alight Motion Look Builder card)."""
+        if not hasattr(self, '_dub_am_status_var'):
+            return
+        template = self.settings.get('am_template', 'None')
+        if not template or template == 'None':
+            self._dub_am_status_var.set(
+                'No Alight Motion template selected. Pick one in the Quick '
+                'Process tab.')
+        else:
+            self._dub_am_status_var.set('Active template: ' + template)
+
+    _DUB_TRANSITION_NAMES = [
+        ('transition_fade_in', 'Fade In'),
+        ('transition_fade_out', 'Fade Out'),
+        ('transition_zoom_in', 'Zoom In'),
+        ('transition_zoom_out', 'Zoom Out'),
+        ('transition_blur_in', 'Blur In'),
+        ('transition_blur_out', 'Blur Out'),
+        ('transition_slide_in', 'Slide In'),
+        ('transition_slide_out', 'Slide Out'),
+        ('transition_wipe_in', 'Wipe In'),
+        ('transition_wipe_out', 'Wipe Out'),
+        ('transition_glitch_start', 'Glitch Start'),
+        ('transition_glitch_end', 'Glitch End'),
+        ('transition_cinematic_bars', 'Cinematic Bars'),
+        ('lens_flare_enabled', 'Lens Flare'),
+        ('light_leak_enabled', 'Light Leak'),
+        ('film_burn_enabled', 'Film Burn'),
+        ('transition_bounce', 'Bounce'),
+        ('transition_mask', 'Mask Reveal'),
+        ('transition_bounce_mask', 'Bounce+Mask'),
+        ('transition_radial_wipe', 'Radial Wipe'),
+        ('transition_color_dissolve', 'Color Dissolve'),
+        ('transition_split_wipe', 'Split Wipe'),
+        ('transition_luma_wipe', 'Luma Wipe'),
+    ]
+
+    def _dub_refresh_trans_summary(self):
+        """List the transitions currently enabled in the Transitions tab."""
+        if not hasattr(self, '_dub_trans_summary_var'):
+            return
+        enabled = [name for k, name in self._DUB_TRANSITION_NAMES
+                   if self.settings.get(k, False)]
+        if not enabled:
+            self._dub_trans_summary_var.set(
+                'No transitions are currently enabled in the Transitions tab.')
+        else:
+            self._dub_trans_summary_var.set(
+                'Enabled transitions that will run during Dubbing: '
+                + ' | '.join(enabled) + '.')
 
     def _dub_slider(self, parent, label, var, key):
         row = tk.Frame(parent, bg=AppStyles.BG_CARD)
