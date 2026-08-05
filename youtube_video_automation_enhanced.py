@@ -115,24 +115,26 @@ except ImportError:
 
 # ⚡ SPEED: probe the ffmpeg NVENC encoder ONCE per process, not per render.
 # The previous code spawned `ffmpeg -encoders` on every single video render.
-_NVENC_CACHE = None
+# Cache is keyed by the ffmpeg binary so callers may pass a custom path
+# (silence-removal) or rely on the default PATH `ffmpeg` (OpenCV renderer).
+_NVENC_CACHE = {}
 
-def _nvenc_available():
-    """Return True if ffmpeg exposes the h264_nvenc (NVIDIA GPU) encoder.
+def _nvenc_available(ffmpeg='ffmpeg'):
+    """Return True if this ffmpeg build exposes the h264_nvenc (NVIDIA GPU) encoder.
 
-    Result is cached for the lifetime of the process. On a laptop without an
-    NVIDIA GPU this returns False and callers fall back to libx264.
+    Result is cached per binary for the lifetime of the process. On a laptop
+    without an NVIDIA GPU this returns False and callers fall back to libx264.
     """
     global _NVENC_CACHE
-    if _NVENC_CACHE is None:
+    if ffmpeg not in _NVENC_CACHE:
         import subprocess as _sp
         try:
-            _r = _sp.run(['ffmpeg', '-encoders'],
+            _r = _sp.run([ffmpeg, '-encoders'],
                          capture_output=True, text=True, timeout=5)
-            _NVENC_CACHE = 'h264_nvenc' in _r.stdout
+            _NVENC_CACHE[ffmpeg] = 'h264_nvenc' in _r.stdout
         except Exception:
-            _NVENC_CACHE = False
-    return _NVENC_CACHE
+            _NVENC_CACHE[ffmpeg] = False
+    return _NVENC_CACHE[ffmpeg]
 
 class _SequentialFrameReader:
     """Read frames from a video file using OpenCV, optimized for sequential access.
@@ -15605,17 +15607,6 @@ def _transcode_for_moviepy(video_path, ffmpeg, codec: str) -> Path | None:
     except Exception:
         pass
     return None
-
-
-def _nvenc_available(ffmpeg) -> bool:
-    """True if this ffmpeg build includes the NVIDIA h264_nvenc encoder."""
-    import subprocess
-    try:
-        r = subprocess.run([ffmpeg, '-hide_banner', '-encoders'],
-                           capture_output=True, text=True, timeout=30)
-        return 'h264_nvenc' in (r.stdout + r.stderr)
-    except Exception:
-        return False
 
 
 def _ffmpeg_cut_concat(video_path, output_path, segments, ffmpeg, nvenc: bool) -> bool:
