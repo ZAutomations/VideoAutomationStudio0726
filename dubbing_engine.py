@@ -1326,7 +1326,9 @@ def dub_video(video_path: Path, out_video: Path, target_language: str,
         log('warn', f'Dub: could not validate input video ({e}) — continuing')
 
     dub_mp3 = out_video.with_suffix('.dub.mp3')
-    captions = [] if settings.get('dub_burn_captions') else None
+    # Burn captions by default; an absent settings key (never toggled / old
+    # saved settings) must NOT silently disable the burn.
+    captions = [] if bool(settings.get('dub_burn_captions', True)) else None
     result = build_dubbed_audio(
         video_path, dub_mp3, target_language, settings, log, progress,
         source_language, captions_out=captions)
@@ -1343,14 +1345,21 @@ def dub_video(video_path: Path, out_video: Path, target_language: str,
         and settings.get('am_template', 'None') != 'None'
     _inc_trans = bool(settings.get('dub_include_transitions', False)) \
         and bool(_enabled_transition_keys(settings))
-    _want_effects = _apply_am or _inc_trans
+    # Our-Script visual overlays (region/custom blur, title text, bottom text
+    # CTA) — each gated by its own dubbing checkbox.
+    _os_overlays = bool(
+        settings.get('dub_region_blur', False)
+        or settings.get('dub_custom_blur', False)
+        or settings.get('dub_title_text', False)
+        or settings.get('dub_bottom_text', False))
+    _want_effects = _apply_am or _inc_trans or _os_overlays
 
     _mux_ok = False
     try:
         # 1) Effects render (MoviePy) — optionally with captions on top.
         if _want_effects:
-            log('info', 'Dub: applying Alight Motion template / transitions '
-                        '(re-render)…')
+            log('info', 'Dub: applying Alight Motion template / transitions / '
+                        'blur / title / bottom-text overlays (re-render)…')
             _eff_tmp = None
             _eff_out = out_video
             if captions:
@@ -1540,72 +1549,152 @@ def _font_family_from_file(font_file) -> str | None:
 
 def _write_dub_ass(ass_path: Path, captions: list, settings: dict,
                    w: int, h: int):
-    """Write an ASS subtitle file for translated dub captions.
+    """Write the ASS subtitle file for translated dub captions.
 
-    One Dialogue event per line; each window is exactly where the dubbed audio
-    plays.  Styled from the caption settings (font file/size, colors, bg box,
-    position) so the dub captions look like the tool's other captions.
+    Rather than inventing a fixed boxed style, this HONORS whatever caption
+    theme the user selected in the Captions tab by delegating to the same
+    ``clipper_captions.build_ass`` engine the Simple/CapCut captions use
+    (``clipper_caption_preset`` + ``clipper_caption_animation`` + the
+    override settings).  Each translated line is split into its words with
+    evenly distributed timings across the line's duration, so word-level
+    animations ("one word at a time", word reveal, active-word highlight)
+    behave exactly as in the main pipeline; grouping animations honour the
+    caption ``words_per_line`` / layout settings.
     """
-    _ff = settings.get('caption_highlight_font_file',
-                       'C:/Windows/Fonts/arialbd.ttf')
-    fam = _font_family_from_file(_ff) or settings.get(
-        'caption_font_style', 'Arial') or 'Arial'
-    fam = str(fam).split(',')[0].strip() or 'Arial'
-
-    _fs = int(settings.get('caption_font_size', 60) or 60)
-    fs = max(12, int(_fs * h / 1920.0)) if h else _fs
-
-    fg = _css_hex_to_ass(str(settings.get('caption_highlight_color', '#FFFFFF')))
-    stroke = _css_hex_to_ass(str(settings.get('caption_stroke_color', '#000000')))
-    box = _css_hex_to_ass(
-        str(settings.get('caption_active_stroke_color', '#FF1493')))
-    # caption_bg_opacity is stored inconsistently (0..1 in the renderer,
-    # 0..255 in the GUI slider) — normalize, then to an ASS alpha byte
-    # (00=opaque, FF=transparent).
     try:
-        _op = float(settings.get('caption_bg_opacity', 0.7) or 0.7)
-    except Exception:
-        _op = 0.7
-    if _op > 1.0:
-        _op = _op / 255.0
-    _box_a = max(0, min(255, int(round(255 * _op))))
-    box_color = f'&H{255 - _box_a:02X}{box[4:]}'   # box[4:] = BBGGRR (6 chars)
+        from clipper_captions import build_ass, get_preset, DEFAULT_PRESET
+    except Exception as e:
+        raise RuntimeError(f'could not load caption engine ({e})')
 
-    pos = str(settings.get('caption_position', 'bottom'))
-    align = 8 if pos == 'top' else 2
-    try:
-        y_off = int(settings.get('caption_y_offset', 0) or 0)
-    except Exception:
-        y_off = 0
-
-    def _ts(s):
-        return (f'{int(s // 3600)}:{int(s % 3600 // 60):02d}:{s % 60:05.2f}')
-
-    lines = [
-        '[Script Info]',
-        'ScriptType: v4.00+',
-        f'PlayResX: {w}',
-        f'PlayResY: {h}',
-        'WrapStyle: 0',
-        '',
-        '[V4+ Styles]',
-        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, '
-        'OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, '
-        'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
-        'Alignment, MarginL, MarginR, MarginV, Encoding',
-        f'Style: Dub,{fam},{fs},{fg},{fg},{stroke},{box_color},-1,0,0,0,'
-        f'100,100,0,0,3,2,0,{align},30,30,{40 + y_off},1',
-        '',
-        '[Events]',
-        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, '
-        'Effect, Text',
-    ]
+    # Split each translated line into its words with evenly distributed
+    # timings across the line's duration.  The caption engine's word-level
+    # animations ("one word at a time", word reveal, active-word highlight)
+    # are driven by per-word start/end times — feeding the whole line as a
+    # single "word" would collapse them into one whole-line pop.  Without
+    # target-language word timing this even split is the faithful proxy.
+    words: list = []
     for c in captions:
-        _txt = (c.get('text') or '').replace('{', '(').replace('}', ')')
-        _txt = _txt.replace('\n', r'\N').replace('\\', r'\\')
-        lines.append(
-            f'Dialogue: 0,{_ts(c["start"])},{_ts(c["end"])},Dub,,0,0,0,,{_txt}')
-    ass_path.write_text('\n'.join(lines) + '\n', encoding='utf-8-sig')
+        text = (c.get('text') or '').strip()
+        if not text:
+            continue
+        start = float(c['start'])
+        end = float(c['end'])
+        if end <= start:
+            end = start + 0.6
+        parts = text.split()
+        n = len(parts)
+        dur = end - start
+        for i, word in enumerate(parts):
+            w_start = start + dur * i / n
+            w_end = start + dur * (i + 1) / n
+            words.append({'word': word, 'start': w_start, 'end': w_end})
+    if not words:
+        raise RuntimeError('no caption text to write')
+
+    # ── Same override strategy as the Our Script tab's Pro Captions (ASS)
+    # ── burn (youtube_video_automation_enhanced.py clipper block) ──────────
+    # Read the preset + animation from the shared Captions-tab settings and
+    # construct the identical override dict, so the dub burns captions that
+    # look EXACTLY like the Our Script tab would for the same settings.
+    _preset_id = settings.get('clipper_caption_preset', DEFAULT_PRESET)
+    _animation = settings.get('clipper_caption_animation', 'none')
+    _preset = get_preset(_preset_id)
+
+    _ov: dict = {}
+    # Animation — only when the user picked one; otherwise the preset's own
+    # animation (e.g. Beast Pop = highlight) is preserved.
+    if _animation != 'none':
+        _ov['animation'] = _animation
+    # Position — only when it differs from the preset's baked-in position, so
+    # presets that specify their own (e.g. Beast Pop = center) keep it.
+    _gpos = settings.get('caption_position', 'bottom')
+    _preset_pos = _preset.get('position', 'bottom')
+    if _gpos != _preset_pos:
+        _ov['position'] = _gpos
+    # Font size scales from the global caption-size slider, relative to the
+    # preset's tuned size — exactly what the Our Script ASS does.
+    _user_fs = int(settings.get('caption_font_size', 60) or 60)
+    _preset_fs = int(_preset.get('font_size', 90))
+    if _preset_fs > 0:
+        _ov['font_scale'] = _user_fs / _preset_fs
+    # Y offset → inline pos() tag (needs BOTH pos_x and pos_y; pos_y is
+    # relative to the position anchor so placement is predictable).
+    _yoff = int(settings.get('caption_y_offset', 0) or 0)
+    _yoff_anchors = {'top': 10.0, 'center': 50.0, 'bottom': 78.0}
+    _yoff_base = _yoff_anchors.get(_gpos, 78.0)
+    if _yoff != 0:
+        _ov['pos_x'] = 50.0
+        _ov['pos_y'] = _yoff_base + (_yoff / 1920.0 * 100.0)
+    elif _gpos == 'center':
+        # Even at 0 offset, center needs the inline pos pair.
+        _ov['pos_x'] = 50.0
+        _ov['pos_y'] = 50.0
+    # Words-per-caption → max_words; 1-line layout → max_lines.
+    _wpc = int(settings.get('caption_words_per_line', 3) or 3)
+    _ov['max_words'] = _wpc
+    if settings.get('caption_layout', '2-line') == '1-line':
+        _ov['max_lines'] = 1
+    # Clipper override colors / font / stroke / bold / bg — only when set.
+    _ov_hi = settings.get('clipper_override_highlight_color', '')
+    if _ov_hi:
+        _ov['highlight_color'] = _ov_hi
+    _ov_pri = settings.get('clipper_override_primary_color', '')
+    if _ov_pri:
+        _ov['primary_color'] = _ov_pri
+    _ov_stk_col = settings.get('clipper_override_stroke_color', '')
+    if _ov_stk_col:
+        _ov['outline_color'] = _ov_stk_col
+    _ov_fam = settings.get('clipper_override_font_family', '')
+    if _ov_fam:
+        _ov['font_family'] = _ov_fam
+    if settings.get('clipper_override_bold', False):
+        _ov['bold'] = True
+    _ov_stk = int(settings.get('clipper_override_stroke', 0) or 0)
+    if _ov_stk > 0:
+        _ov['outline'] = _ov_stk
+    if settings.get('clipper_override_bg_enabled', False):
+        _ov['background_enabled'] = True
+        _ov_bg_col = settings.get('clipper_override_bg_color', '#000000')
+        if _ov_bg_col:
+            _ov['background_color'] = _ov_bg_col
+        _ov['background_opacity'] = int(
+            settings.get('clipper_override_bg_opacity', 80) or 80)
+
+    build_ass(
+        words=words,
+        style_preset=_preset_id,
+        video_w=w,
+        video_h=h,
+        out_path=ass_path,
+        overrides=_ov if _ov else None,
+    )
+    return ass_path
+
+
+def _dub_ass_vf(ass_path: Path) -> str:
+    """Build the ffmpeg ``ass=`` video-filter string for a dub caption burn.
+
+    Mirrors the Our Script clipper burn: single-quote the filename AND escape
+    the Windows drive-letter colon, and ALSO pass ``fontsdir`` pointing at the
+    bundled fonts folder so libass resolves preset fonts that aren't installed
+    system-wide (Anton, DM Serif Display, Luckiest Guy, …).  Without fontsdir,
+    libass silently falls back to a default face — which is exactly the
+    "captions use a random font, not the selected preset" symptom.
+    """
+    _p = str(ass_path).replace('\\', '/')
+    _p = re.sub(r'([:])', r'\\\1', _p)   # D:/… -> D\:/… (escape drive colon)
+    _fd_arg = ''
+    try:
+        import caption_fonts as _cf
+        _fd = str(_cf.get_fonts_dir()).replace('\\', '/')
+        _fd = re.sub(r'([:])', r'\\\1', _fd)
+        _fd_arg = f":fontsdir='{_fd}'"
+    except Exception:
+        _fd_arg = ''
+    # ffmpeg's filter parser splits options on ':' and ',', so the filename must
+    # be single-quoted AND the drive-letter colon escaped. Verified against real
+    # ffmpeg: ass=filename='D\:/tmp/x.ass' is the working form on Windows.
+    return f"ass=filename='{_p}'{_fd_arg},format=yuv420p"
 
 
 def _burn_dub_captions(video_path: Path, dub_mp3: Path, out_video: Path,
@@ -1615,12 +1704,7 @@ def _burn_dub_captions(video_path: Path, dub_mp3: Path, out_video: Path,
     NVENC when available, libx264 otherwise.  Raises on failure — the caller
     falls back to the plain copy-mux.
     """
-    _p = str(ass_path).replace('\\', '/')
-    _p = re.sub(r'([:])', r'\\\1', _p)   # D:/… -> D\:/… (escape drive colon)
-    # ffmpeg's filter parser splits options on ':' and ',', so the filename must
-    # be single-quoted AND the drive-letter colon escaped. Verified against real
-    # ffmpeg: ass=filename='D\:/tmp/x.ass' is the working form on Windows.
-    vf = f"ass=filename='{_p}',format=yuv420p"
+    vf = _dub_ass_vf(ass_path)
     if _nvenc_available():
         _v = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23',
               '-pix_fmt', 'yuv420p']
@@ -1644,9 +1728,7 @@ def _burn_captions_on_video(video_path: Path, out_video: Path,
     PRESERVING its existing audio track (used after the effects render, which
     already carries the dubbed audio).  Raises on failure.
     """
-    _p = str(ass_path).replace('\\', '/')
-    _p = re.sub(r'([:])', r'\\\1', _p)
-    vf = f"ass=filename='{_p}',format=yuv420p"
+    vf = _dub_ass_vf(ass_path)
     if _nvenc_available():
         _v = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23',
               '-pix_fmt', 'yuv420p']
@@ -1724,4 +1806,360 @@ def _render_dub_with_effects(video_path: Path, dub_mp3: Path, out_video: Path,
             audio.close()
         except Exception:
             pass
-    log('ok', 'Dub: ✅ effects render done (AM look + transitions)')
+    log('ok', 'Dub: ✅ effects render done (AM look / transitions / overlays)')
+
+
+def render_dub_overlay_frame(video_path, settings, time_sec=None, log=None,
+                             caption_text=None):
+    """Render ONE frame of the dubbed-overlay look as a PIL RGB image.
+
+    Mirrors the Our Script live preview: pull the frame at ``time_sec`` (or the
+    middle of the clip) and draw the SAME overlay view the dub effects render
+    builds (region/custom blur per dub toggles), PLUS visual debugging overlays
+    (blue outlines for region blur, red outlines + actual blur for custom
+    regions, green for inpaint) so the user can see WHERE each element sits
+    before running the slow full dub.
+
+    ``caption_text`` lets the live preview show the ACTUAL translated text for
+    the current scrub time instead of a static placeholder.
+
+    Returns a PIL ``Image`` (RGB).
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    from youtube_video_automation_enhanced import (
+        VideoEffects, _draw_text_simple)
+
+    video_path = Path(video_path)
+
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        if time_sec is None:
+            frame_idx = int(n * 0.5) if n > 2 else 0
+        else:
+            frame_idx = max(0, int(round(float(time_sec) * fps)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, fr = cap.read()
+        if not ok or fr is None:
+            raise RuntimeError('could not read a frame from the video')
+        fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+    finally:
+        cap.release()
+
+    h, w = fr.shape[:2]
+    img = Image.fromarray(fr).convert('RGBA')
+    draw = ImageDraw.Draw(img, 'RGBA')
+
+    # ── Preview-show toggles (mirror Our Script) ──────────────────────────
+    show_blur = settings.get('dub_preview_show_blur', True)
+    show_title = settings.get('dub_preview_show_title', True)
+    show_caption = settings.get('dub_preview_show_caption', True)
+    show_bottom = settings.get('dub_preview_show_bottom', True)
+
+    # ── Visual debugging overlays — MIRROR the Our Script live preview
+    #    (_os_open_live_preview): region blur drawn as a BLUE outline (+ tint
+    #    if enabled), custom regions actually blurred/covered with a RED (blur)
+    #    or GREEN (inpaint) outline + name label — so the user sees WHERE each
+    #    element lands, exactly like the Our Script tab. ──────────────────────
+
+    # 1) Region-blur preset shape (blue outline + optional tint)
+    if show_blur and settings.get('dub_region_blur', False) \
+            and settings.get('region_blur_enabled', False):
+        size_pct = int(settings.get('blur_region_size', 20))
+        tint_on = settings.get('blur_color_tint_enabled', False)
+        tint_hex = settings.get('blur_tint_color', '#000000')
+        tint_op = int(settings.get('blur_tint_opacity', 50))
+        crop_t = int(settings.get('blur_crop_top', 0))
+        crop_b = int(settings.get('blur_crop_bottom', 30))
+        crop_l = int(settings.get('blur_crop_left', 0))
+        crop_r = int(settings.get('blur_crop_right', 0))
+        rng_rects = []
+        s = size_pct / 100.0
+        e_top = settings.get('blur_enable_top', False)
+        e_bot = settings.get('blur_enable_bottom', False)
+        e_left = settings.get('blur_enable_left', False)
+        e_right = settings.get('blur_enable_right', False)
+        if any([e_top, e_bot, e_left, e_right]):
+            s_top = max(0.0, min(1.0, int(settings.get('blur_top_size', size_pct)) / 100.0))
+            s_bot = max(0.0, min(1.0, int(settings.get('blur_bottom_size', size_pct)) / 100.0))
+            s_left = max(0.0, min(1.0, int(settings.get('blur_left_size', size_pct)) / 100.0))
+            s_right = max(0.0, min(1.0, int(settings.get('blur_right_size', size_pct)) / 100.0))
+            if e_top:
+                rng_rects.append((0, 0, w, int(h * s_top)))
+            if e_bot:
+                rng_rects.append((0, h - int(h * s_bot), w, h))
+            if e_left:
+                rng_rects.append((0, 0, int(w * s_left), h))
+            if e_right:
+                rng_rects.append((w - int(w * s_right), 0, w, h))
+        else:
+            rng = settings.get('blur_region', 'bottom')
+            if rng in ('top_bottom', 'left_right'):
+                half = s / 2.0
+                if rng == 'top_bottom':
+                    rng_rects.append((0, 0, w, int(h * half)))
+                    rng_rects.append((0, h - int(h * half), w, h))
+                else:
+                    rng_rects.append((0, 0, int(w * half), h))
+                    rng_rects.append((w - int(w * half), 0, w, h))
+            elif rng == 'top':
+                rng_rects.append((0, 0, w, int(h * s)))
+            elif rng == 'bottom':
+                rng_rects.append((0, h - int(h * s), w, h))
+            elif rng == 'left':
+                rng_rects.append((0, 0, int(w * s), h))
+            elif rng == 'right':
+                rng_rects.append((w - int(w * s), 0, w, h))
+            elif rng == 'center':
+                cx, cy = w // 2, h // 2
+                bw, bh = int(w * s), int(h * s)
+                rng_rects.append((cx - bw // 2, cy - bh // 2,
+                                  cx + bw // 2, cy + bh // 2))
+        blur_mode = settings.get('region_blur_mode', 'blur')
+        for (x1, y1, x2, y2) in rng_rects:
+            x1, y1 = max(x1, crop_l), max(y1, crop_t)
+            x2, y2 = min(x2, w - crop_r), min(y2, h - crop_b)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if blur_mode == 'cover':
+                cover_color = settings.get('cover_color', '#000000')
+                cover_opacity = int(settings.get('cover_opacity', 85))
+                cover_radius = int(settings.get('cover_radius', 8))
+                try:
+                    cc = tuple(int(cover_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+                except Exception:
+                    cc = (0, 0, 0)
+                ca = max(0, min(255, int(cover_opacity * 2.55)))
+                rw = x2 - x1
+                r_px = max(0, int(rw * cover_radius / 100))
+                try:
+                    draw.rounded_rectangle(
+                        [x1, y1, x2, y2], radius=r_px,
+                        fill=cc + (ca,), outline='#3b82f6', width=2)
+                except AttributeError:
+                    draw.rectangle([x1, y1, x2, y2],
+                                   fill=cc + (ca,), outline='#3b82f6', width=2)
+            else:
+                if tint_on:
+                    try:
+                        tc = tuple(int(tint_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+                    except Exception:
+                        tc = (0, 0, 0)
+                    alpha = max(0, min(255, int(tint_op * 2.55)))
+                    draw.rectangle([x1, y1, x2, y2], fill=tc + (alpha,))
+                draw.rectangle([x1, y1, x2, y2], outline='#3b82f6', width=4)
+
+    # 2) Custom blur regions (actual blur/cover + red/green outline + label)
+    if show_blur and settings.get('dub_custom_blur', False):
+        try:
+            label_font = ImageFont.truetype('arial.ttf', 18)
+        except Exception:
+            label_font = ImageFont.load_default()
+        for region in settings.get('custom_blur_regions', []) or []:
+            if not isinstance(region, dict) or not region.get('enabled', False):
+                continue
+            x_pct = region.get('x', 0)
+            y_pct = region.get('y', 0)
+            rw_pct = region.get('width', 30)
+            rh_pct = region.get('height', 10)
+            x1 = int(w * x_pct / 100)
+            y1 = int(h * y_pct / 100)
+            x2 = int(w * (x_pct + rw_pct) / 100)
+            y2 = int(h * (y_pct + rh_pct) / 100)
+            if region.get('cover_mode', False):
+                fill_color = region.get('fill_color', '#000000')
+                fill_opacity = int(region.get('fill_opacity', 80))
+                cover_radius = int(region.get('cover_radius', 8))
+                try:
+                    cc = tuple(int(fill_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+                except Exception:
+                    cc = (0, 0, 0)
+                ca = max(0, min(255, int(fill_opacity * 2.55)))
+                rw = x2 - x1
+                r_px = max(0, int(rw * cover_radius / 100))
+                try:
+                    draw.rounded_rectangle(
+                        [x1, y1, x2, y2], radius=r_px,
+                        fill=cc + (ca,), outline='#ef4444', width=2)
+                except AttributeError:
+                    draw.rectangle([x1, y1, x2, y2],
+                                   fill=cc + (ca,), outline='#ef4444', width=2)
+            elif region.get('mode', 'blur') == 'inpaint':
+                draw.rectangle([x1, y1, x2, y2], outline='#22c55e', width=4)
+                draw.rectangle([x1, y1, x2, y2], fill=(34, 197, 94, 40))
+            else:
+                bf_color = region.get('fill_color', '')
+                bf_op = int(region.get('fill_opacity', 0))
+                intensity = int(region.get('intensity', 12))
+                try:
+                    rgn = img.crop((x1, y1, x2, y2))
+                    blur_radius = max(1, intensity // 3)
+                    rgn = rgn.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                    if bf_color and bf_op > 0:
+                        try:
+                            bfc = tuple(int(bf_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+                        except Exception:
+                            bfc = (255, 255, 255)
+                        bfa = max(0, min(255, int(bf_op * 2.55)))
+                        rgn_rgba = rgn.convert('RGBA')
+                        fill_layer = Image.new('RGBA', rgn.size, bfc + (bfa,))
+                        rgn = Image.alpha_composite(rgn_rgba, fill_layer)
+                    img.paste(rgn, (x1, y1))
+                    draw.rectangle([x1, y1, x2, y2], outline='#ef4444', width=4)
+                except Exception:
+                    draw.rectangle([x1, y1, x2, y2], outline='#ef4444', width=4)
+            name = region.get('name', 'Region')
+            mode_tag = ' [AI Remove]' if region.get('mode', 'blur') == 'inpaint' else ''
+            tag_color = '#22c55e' if region.get('mode', 'blur') == 'inpaint' else '#ef4444'
+            draw.text((x1 + 6, y1 + 6), f'{name}{mode_tag}',
+                      fill=tag_color, font=label_font)
+
+    if show_title and settings.get('dub_title_text', False):
+        tt = (settings.get('our_script_title_text', '') or '').strip()
+        if tt:
+            _draw_text_simple(
+                draw, img, tt,
+                settings.get('our_script_title_position', 'top'),
+                settings.get('our_script_title_text_color', '#FFFFFF'),
+                settings.get('our_script_title_bg_color', '#000000'),
+                int(settings.get('our_script_title_bg_opacity', 80)),
+                int(settings.get('our_script_title_font_size', 70)),
+                settings.get('our_script_title_font_family', 'Arial'),
+                y_offset=int(settings.get('vertical_offset', 0)))
+
+    if show_bottom and settings.get('dub_bottom_text', False):
+        bt = (settings.get('bottom_text_content', '') or '').strip()
+        if bt:
+            _draw_text_simple(
+                draw, img, bt, 'bottom',
+                settings.get('bottom_text_text_color', '#FFFFFF'),
+                settings.get('bottom_text_bg_color', '#000000'),
+                int(settings.get('bottom_text_bg_opacity', 80)),
+                int(settings.get('bottom_text_font_size', 45)),
+                settings.get('bottom_text_font_family', 'Arial'),
+                y_offset=int(settings.get('bottom_text_vertical_offset', 0)))
+
+    # Caption sample at the caption position — in a live preview this is the
+    # actual translated line active at the scrub time, else a placeholder.
+    # Style is resolved from the SAME clipper caption preset + overrides the
+    # actual dub burn (``_write_dub_ass``) uses, so the preview honors the
+    # selected "caption ASS" instead of painting a fixed default palette.
+    if show_caption and settings.get('dub_burn_captions', True):
+        _cs = _resolve_preview_caption_style(settings)
+        # Scale the font the same way the ASS burn does (caption_font_size
+        # relative to the 1080-wide reference frame height of 1920).
+        _cs_fs = max(8, int(_cs['font_size'] * img.height / 1920.0))
+        _draw_text_simple(
+            draw, img, _preview_caption_chunk(
+                caption_text or 'Translated captions appear here', settings),
+            _cs['position'], _cs['primary'], _cs['stroke'],
+            _cs['bg_opacity'], _cs_fs, _cs['font_family'],
+            y_offset=int(settings.get('caption_y_offset', 0)),
+            bg_enabled=_cs['bg_enabled'])
+
+    return img.convert('RGB')
+
+
+def _resolve_preview_caption_style(settings):
+    """Resolve the caption-face the dub will burn — the clipper preset +
+    override keys — as flat draw params for ``_draw_text_simple``.
+
+    Mirrors ``_write_dub_ass`` (and the Captions tab's own live preview) so the
+    dub overlay preview shows the SAME font/colors/size/position the actual
+    burned captions will, not a hard-coded fallback palette.
+    """
+    try:
+        from clipper_captions import get_preset, DEFAULT_PRESET
+    except Exception:
+        get_preset = None
+        DEFAULT_PRESET = 'bold_white'
+
+    preset = {}
+    if get_preset is not None:
+        try:
+            preset = get_preset(
+                settings.get('clipper_caption_preset', DEFAULT_PRESET)) or {}
+        except Exception:
+            preset = {}
+
+    def _ov(override_key, preset_key, fallback):
+        v = settings.get(override_key)
+        if v:
+            return v
+        return preset.get(preset_key, fallback)
+
+    primary = _ov('clipper_override_primary_color', 'primary_color', '#FFFFFF')
+    outline = _ov('clipper_override_stroke_color', 'outline_color', '#000000')
+    family = _ov('clipper_override_font_family', 'font_family', 'Roboto')
+
+    # Font size — the burn scales the global caption-size slider onto the
+    # preset (preset_fs * (user_fs/preset_fs) = user_fs, then scaled by the
+    # frame height).  The caller scales by the preview frame's height.
+    size = int(settings.get('caption_font_size', 60) or 60)
+
+    bg_enabled = bool(settings.get('clipper_override_bg_enabled', False)) \
+        or bool(preset.get('background_enabled', False))
+    bg_color = (settings.get('clipper_override_bg_color', '') or ''
+                or preset.get('background_color', '#000000'))
+    bg_op = int(settings.get('clipper_override_bg_opacity', 0) or 0)
+    if not bg_op:
+        bg_op = int(preset.get('background_opacity', 80) or 80)
+
+    # Position — mirror the burn (build_ass): the global caption_position
+    # only overrides the preset's baked-in position when they differ.
+    ppos = preset.get('position', 'bottom')
+    _gpos = settings.get('caption_position', 'bottom')
+    if _gpos != ppos:
+        ppos = _gpos
+    if ppos not in ('top', 'center', 'bottom'):
+        ppos = 'bottom'
+
+    return {
+        'position': ppos,
+        'primary': primary,
+        'stroke': outline,
+        'bg_color': bg_color,
+        'bg_enabled': bg_enabled,
+        'bg_opacity': bg_op,
+        'font_size': size,
+        'font_family': family,
+    }
+
+
+def _preview_caption_chunk(text, settings, max_lines=2):
+    """Shorten a live-preview caption to what the real dub shows at one time.
+
+    The real dub splits each translated line into word groups of
+    ``caption_words_per_line`` (default 3) words and shows only a few at a
+    time; dumping the whole diarized speaker segment makes the preview
+    word-wrap into dozens of lines and fill the entire frame.
+    """
+    wpl = int(settings.get('caption_words_per_line', 3) or 3)
+    wpl = max(1, min(wpl, 8))
+    words = str(text).split()
+    if not words:
+        return str(text)
+    chunks = [' '.join(words[i:i + wpl]) for i in range(0, len(words), wpl)]
+    return '\n'.join(chunks[:max_lines])
+
+
+def preview_dub_overlays(video_path, settings, log, out_png=None):
+    """Render ONE frame of the dubbed-overlay look and save it as a PNG.
+
+    Convenience wrapper around :func:`render_dub_overlay_frame` for the
+    "🖼 Preview overlays" button — writes the PNG and returns its path.
+    """
+    video_path = Path(video_path)
+    if out_png is None:
+        out_png = video_path.with_suffix('.dub_overlay_preview.png')
+    else:
+        out_png = Path(out_png)
+
+    img = render_dub_overlay_frame(video_path, settings, time_sec=None,
+                                   log=log)
+    img.save(str(out_png))
+    log('ok', f'Preview: ✅ overlay preview written → {out_png}')
+    return out_png

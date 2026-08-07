@@ -26,7 +26,7 @@ import traceback
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 
 import dubbing_engine
 
@@ -143,6 +143,26 @@ class DubbingTabMixin:
         scrollable.bind('<Configure>',
                         lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
         _win = canvas.create_window((0, 0), window=scrollable, anchor='nw')
+
+        # Cards are laid out in a 3-column grid (parallel, EQUAL width) so the
+        # user doesn't have to scroll down a single tall stack. Each card packs
+        # fill='x' into one of these columns. Columns are forced to EQUAL width
+        # via a grid with `uniform` weight — plain pack(fill='both', expand=True)
+        # only equalizes the EXTRA space, so wide cards made narrower columns.
+        # The scrollbar still works if the columns exceed the visible height.
+        # NOTE: grid_frame is packed at the END of create_dubbing_tab (after the
+        # run row + status line) so those full-width controls stay on top.
+        self._dub_grid = {}
+        self._dub_grid_cols = []
+        self._dub_grid_idx = 0
+        self._dub_grid_frame = tk.Frame(scrollable, bg=AppStyles.BG_CARD)
+        for _ci in range(3):
+            self._dub_grid_frame.columnconfigure(_ci, weight=1, uniform='dubcol')
+        self._dub_grid_frame.rowconfigure(0, weight=1)
+        for _ci in range(3):
+            _col = tk.Frame(self._dub_grid_frame, bg=AppStyles.BG_CARD)
+            _col.grid(row=0, column=_ci, sticky='nsew', padx=4)
+            self._dub_grid_cols.append(_col)
         # Bind the inner frame's width to the canvas width so cards reflow to the
         # available space instead of keeping their natural width and OVERLAPPING.
         canvas.bind('<Configure>', lambda e: canvas.itemconfigure(_win, width=e.width))
@@ -539,12 +559,19 @@ class DubbingTabMixin:
                            self._dub_burn_captions_var.get())).pack(
                                anchor='w', padx=8, pady=(2, 0))
         tk.Label(opt_card,
-                 text='   Shows the translated text (dubbed language) synced to '
+                 text='■ Shows the translated text (dubbed language) synced to '
                       'the new voice, styled from your caption settings. Re-encodes '
                       'the video, so the output becomes H.264.',
                  bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
                  font=('Segoe UI', 8, 'italic'), justify='left',
                  wraplength=500).pack(anchor='w', padx=8, pady=(0, 6))
+
+        # ── Caption style (the ASS face the burned captions use) ──────────
+        # Shares the SAME clipper preset + animation keys the 💬 Captions tab
+        # writes, so the dub burn honors "my selected caption ASS" — and you
+        # can pick it right here.
+        self._dub_caption_preset_var, self._dub_caption_anim_var = \
+            self._dub_build_caption_style_card(scrollable)
 
         # Alight Motion template status (set in Quick Process tab) ----------
         am_card = self._dub_card(scrollable,
@@ -616,6 +643,15 @@ class DubbingTabMixin:
                   font=('Segoe UI', 8), padx=10, pady=2).pack(
                       anchor='w', pady=(6, 0))
 
+        # Our-Script visual overlays (mirror the Our Script tab cards) -------
+        # Our-Script visual overlays (mirror the Our Script tab cards) -------
+        # Each card below shares the EXACT same settings keys as the matching
+        # Our Script tab card, so the dubbed render honors precisely what you
+        # set there (region blur + border, custom blur regions, title, CTA).
+        self._dub_build_region_blur_card(scrollable)
+        self._dub_build_custom_blur_card(scrollable)
+        self._dub_build_title_card(scrollable)
+        self._dub_build_bottom_text_card(scrollable)
         # ── 4) Run button + progress ───────────────────────────────────
         run_row = tk.Frame(scrollable, bg=AppStyles.BG_CARD)
         run_row.pack(fill='x', pady=(4, 2))
@@ -624,6 +660,16 @@ class DubbingTabMixin:
             hover_color='#059669', font=('Segoe UI', 11, 'bold'),
             padx=18, pady=8, command=self._dub_start)
         self._dub_run_btn.pack(side='left')
+        self._dub_preview_btn = ModernButton(
+            run_row, text='🖼  Preview overlays', bg_color=AppStyles.ACCENT_INFO,
+            hover_color='#0891b2', font=('Segoe UI', 10, 'bold'),
+            padx=14, pady=6, command=self._dub_preview_overlays)
+        self._dub_preview_btn.pack(side='left', padx=(8, 0))
+        self._dub_live_preview_btn = ModernButton(
+            run_row, text='🔍  Live Preview', bg_color=AppStyles.ACCENT_WARNING,
+            hover_color='#d97706', font=('Segoe UI', 10, 'bold'),
+            padx=14, pady=6, command=self._dub_open_live_preview)
+        self._dub_live_preview_btn.pack(side='left', padx=(8, 0))
 
         self._dub_progress_var = tk.DoubleVar(value=0)
         ttk.Progressbar(run_row, mode='determinate',
@@ -636,13 +682,56 @@ class DubbingTabMixin:
                  bg=AppStyles.BG_CARD, fg=AppStyles.ACCENT_PRIMARY,
                  font=('Segoe UI', 9)).pack(anchor='w', pady=(0, 4))
 
+        # Pack the 3-column card grid LAST so it flows below the run row/status.
+        # Constrain it to the scrollable width (pack_propagate off) so the equal
+        # columns shrink to fit the left area instead of spilling under the log.
+        if getattr(self, '_dub_grid_frame', None) is not None:
+            _gf = self._dub_grid_frame
+            _gf.pack_propagate(False)
+            _gf.pack(fill='x', side='top')
+            # Constrain both the scrollable window and grid_frame to the canvas
+            # width so the equal columns fit the left area, not the log. This
+            # REPLACES the earlier canvas <Configure> binding (Tk bind is not
+            # additive), so it must also reflow the scrollable window.
+            try:
+                canvas.bind(
+                    '<Configure>',
+                    lambda e: (canvas.itemconfigure(_win, width=e.width),
+                               _gf.config(width=max(e.width - 12, 200))))
+            except Exception:
+                pass
+
         # ── 5) Log box — small panel on the RIGHT, fills its column height ──
+        # Mirrors the Our Script tab's log: toolbar (auto-scroll/clear/save/
+        # line-count) + timestamped colored lines.
         log_card = tk.Frame(right_col, bg=AppStyles.BG_CARD,
                             highlightbackground='#30363d', highlightthickness=1)
         log_card.pack(fill='both', expand=True)
-        tk.Label(log_card, text='📋 Log', bg=AppStyles.BG_CARD,
+        tk.Label(log_card, text='📋 Dub Log', bg=AppStyles.BG_CARD,
                  fg=AppStyles.ACCENT_PRIMARY,
                  font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=8, pady=(6, 0))
+        # Toolbar: auto-scroll + clear + save + line count
+        _log_toolbar = tk.Frame(log_card, bg=AppStyles.BG_CARD)
+        _log_toolbar.pack(fill='x', padx=6, pady=(2, 1))
+        self._dub_log_autoscroll_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            _log_toolbar, text='Auto-scroll',
+            variable=self._dub_log_autoscroll_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT,
+            activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8)).pack(side='left')
+        ModernButton(_log_toolbar, text='🗑 Clear', bg_color=AppStyles.BG_INPUT,
+                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
+                     command=self._dub_log_clear).pack(side='left', padx=(6, 0))
+        ModernButton(_log_toolbar, text='💾 Save', bg_color=AppStyles.BG_INPUT,
+                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
+                     command=self._dub_log_save).pack(side='left', padx=(4, 0))
+        self._dub_log_lines_var = tk.StringVar(value='0 lines')
+        tk.Label(_log_toolbar, textvariable=self._dub_log_lines_var,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic')).pack(side='right')
+
         _log_wrap = tk.Frame(log_card, bg=AppStyles.BG_CARD)
         _log_wrap.pack(fill='both', expand=True, padx=6, pady=6)
         _log_scroll = ttk.Scrollbar(_log_wrap, orient='vertical')
@@ -653,7 +742,47 @@ class DubbingTabMixin:
             yscrollcommand=_log_scroll.set)
         self._dub_log_widget.pack(side='left', fill='both', expand=True)
         _log_scroll.config(command=self._dub_log_widget.yview)
+        # Level colors — mirror the Our Script log tags.
+        _lt = self._dub_log_widget
+        _lt.tag_configure('ts', foreground='#5b6572')
+        _lt.tag_configure('info', foreground='#e2e8f0')
+        _lt.tag_configure('ok', foreground='#4ade80')
+        _lt.tag_configure('warn', foreground='#fbbf24')
+        _lt.tag_configure('error', foreground='#f87171')
+        _lt.tag_configure('path', foreground='#38bdf8')
+        _lt.tag_configure('header', foreground='#a78bfa', font=('Consolas', 8, 'bold'))
         self._dub_running = False
+
+    # ── Log toolbar helpers (mirror Our Script's _os_log_clear/_os_log_save) ──
+    def _dub_log_clear(self):
+        if not hasattr(self, '_dub_log_widget'):
+            return
+        try:
+            self._dub_log_widget.configure(state='normal')
+            self._dub_log_widget.delete('1.0', 'end')
+            self._dub_log_widget.configure(state='disabled')
+            if hasattr(self, '_dub_log_lines_var'):
+                self._dub_log_lines_var.set('0 lines')
+        except Exception:
+            pass
+
+    def _dub_log_save(self):
+        if not hasattr(self, '_dub_log_widget'):
+            return
+        try:
+            from tkinter import filedialog as _fd
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+            path = _fd.asksaveasfilename(
+                title='Save dub log', defaultextension='.txt',
+                initialfile=f'dub_log_{ts}.txt',
+                filetypes=[('Text files', '*.txt'), ('All files', '*.*')])
+            if not path:
+                return
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(self._dub_log_widget.get('1.0', 'end-1c'))
+        except Exception:
+            pass
 
     # ── Batch-folder helpers ────────────────────────────────────────────
     VIDEO_EXTS = ('.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.flv',
@@ -798,13 +927,894 @@ class DubbingTabMixin:
 
     # ── Small UI helpers ────────────────────────────────────────────────
     def _dub_card(self, parent, title):
-        card = tk.Frame(parent, bg=AppStyles.BG_CARD,
+        # Distribute cards across the 3-column grid (equal width, parallel).
+        # Fall back to packing directly onto *parent* if the grid isn't built
+        # (e.g. isolated harnesses that only call a single *_card builder).
+        cols = getattr(self, '_dub_grid_cols', None)
+        if cols:
+            target = cols[self._dub_grid_idx % len(cols)]
+            self._dub_grid_idx += 1
+        else:
+            target = parent
+        card = tk.Frame(target, bg=AppStyles.BG_CARD,
                         highlightbackground='#30363d', highlightthickness=1)
-        card.pack(fill='x', pady=6)
+        card.pack(fill='x', pady=3)
         tk.Label(card, text=title, bg=AppStyles.BG_CARD,
                  fg=AppStyles.ACCENT_PRIMARY,
-                 font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=8, pady=(6, 0))
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=6, pady=(4, 1))
+        card._body = None
         return card
+
+    def _dub_touch_preview(self, *_):
+        """Refresh the dub live preview if it is open; else do nothing.
+
+        Used as the overlay slider callback so tuning the controls re-renders
+        the open scrub preview without popping an error when no video loaded.
+        """
+        if getattr(self, '_dub_live_preview_refresh', None) is None:
+            return
+        try:
+            # Only re-render if a live-preview window is actually open.
+            if getattr(self, '_dub_lp_canvas', None) is None:
+                return
+            self._dub_live_preview_refresh()
+        except Exception:
+            pass
+
+    def _dub_build_caption_style_card(self, scrollable):
+        """Caption style picker for the burned captions (shared clipper keys)."""
+        card = self._dub_card(scrollable, '🎨 Caption Style (burned ASS)')
+        body = tk.Frame(card, bg=AppStyles.BG_CARD)
+        body.pack(fill='x', padx=8, pady=(2, 8))
+        try:
+            import clipper_captions as _cc
+            _data = _cc.get_presets_for_gui()
+        except Exception:
+            _data = []
+        _labels = [p['label'] for p in _data]
+        _map = {p['label']: p['id'] for p in _data}
+        if not _map:
+            _map = {'Bold White': 'bold_white'}
+            _labels = ['Bold White']
+        _saved = self.settings.get('clipper_caption_preset', 'bold_white')
+        _saved_label = next((l for l, i in _map.items() if i == _saved), _labels[0])
+
+        row1 = tk.Frame(body, bg=AppStyles.BG_CARD)
+        row1.pack(fill='x', pady=(0, 3))
+        tk.Label(row1, text='Style preset:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        preset_var = tk.StringVar(value=_saved_label)
+        cb = ttk.Combobox(row1, textvariable=preset_var, values=_labels,
+                          state='readonly', width=24, font=('Segoe UI', 8))
+        cb.pack(side='left', padx=(6, 0))
+        cb.bind('<<ComboboxSelected>>', lambda e: self.update_setting(
+            'clipper_caption_preset',
+            _map.get(preset_var.get(), 'bold_white')))
+
+        row2 = tk.Frame(body, bg=AppStyles.BG_CARD)
+        row2.pack(fill='x', pady=(0, 2))
+        tk.Label(row2, text='Animation:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        anim_var = tk.StringVar(value=self.settings.get(
+            'clipper_caption_animation', 'none'))
+        an = ttk.Combobox(row2, textvariable=anim_var,
+                          values=['none', 'highlight', 'word_reveal',
+                                  'one_word', 'karaoke'],
+                          state='readonly', width=24, font=('Segoe UI', 8))
+        an.pack(side='left', padx=(6, 0))
+        an.bind('<<ComboboxSelected>>', lambda e: self.update_setting(
+            'clipper_caption_animation', anim_var.get()))
+
+        tk.Label(body,
+                 text='   Shared with the 💬 Captions tab — the dub burns '
+                      'captions in exactly this style. Overrides there '
+                      '(colors / font / stroke / bg) apply too.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), wraplength=520,
+                 justify='left').pack(anchor='w', pady=(2, 0))
+        return preset_var, anim_var
+
+    def _dub_cb_caption_dialog(self, status_label):
+        """'Add Custom Blur Region' dialog for the DUB custom-blur card."""
+        root = self.root
+        dg = tk.Toplevel(root)
+        dg.title('Add Custom Blur Region')
+        dg.geometry('420x340')
+        dg.configure(bg=AppStyles.BG_CARD)
+        dg.transient(root)
+        dg.grab_set()
+        fr = tk.Frame(dg, bg=AppStyles.BG_CARD, padx=16, pady=12)
+        fr.pack(fill='both', expand=True)
+
+        def _scaled_row(label, lo, hi, var):
+            tk.Label(fr, text=label, bg=AppStyles.BG_CARD,
+                     fg=AppStyles.TEXT_DARK, font=('Segoe UI', 9)).pack(anchor='w')
+            tk.Scale(fr, from_=lo, to=hi, resolution=1, orient='horizontal',
+                     variable=var, bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                     troughcolor=AppStyles.BG_INPUT, length=300).pack(fill='x')
+
+        x_v = tk.DoubleVar(value=0)
+        _scaled_row('X offset (%, 0=left edge):', 0, 100, x_v)
+        y_v = tk.DoubleVar(value=0)
+        _scaled_row('Y offset (%, 0=top edge):', 0, 100, y_v)
+        w_v = tk.DoubleVar(value=20)
+        _scaled_row('Width (%, of video):', 1, 100, w_v)
+        h_v = tk.DoubleVar(value=15)
+        _scaled_row('Height (%, of video):', 1, 100, h_v)
+
+        def _save():
+            regions = self.settings.get('custom_blur_regions', []) or []
+            idx = len(regions) + 1
+            regions.append({
+                'label': f'Region {idx}', 'enabled': True,
+                'x': int(x_v.get()), 'y': int(y_v.get()),
+                'width': int(w_v.get()), 'height': int(h_v.get()),
+            })
+            self.update_setting('custom_blur_regions', regions)
+            dg.destroy()
+            self._os_bb_rebuild_cb_list(status_label, status_label,
+                                        '_dub_cb', self._dub_touch_preview)
+        btn = tk.Frame(fr, bg=AppStyles.BG_CARD)
+        btn.pack(pady=12)
+        ModernButton(btn, text='💾 Save', bg_color=AppStyles.ACCENT_SUCCESS,
+                     font=('Segoe UI', 9, 'bold'), padx=16, pady=4,
+                     command=_save).pack(side='left', padx=6)
+        ModernButton(btn, text='Cancel', bg_color='#6c757d',
+                     font=('Segoe UI', 9), padx=16, pady=4,
+                     command=dg.destroy).pack(side='left', padx=6)
+
+    # ── Our-Script overlay mirrors ──────────────────────────────────────────
+    # Exactly the same style controls as the OurScript tab's cards, gated by
+    # the per-feature dubbing checkboxes. Every control writes the SAME shared
+    # settings key the OurScript tab uses, so the dub renders IDENTICAL.
+    # (_dub_* attribute names keep each tab's widget handles independent.)
+    def _dub_build_region_blur_card(self, scrollable):
+        """Region Blur + Border — mirror of the OurScript card (same keys)."""
+        card = self._dub_card(scrollable, '🌻 Region Blur + Border')
+        b = tk.Frame(card, bg=AppStyles.BG_CARD)
+        b.pack(fill='x', padx=8, pady=(2, 8))
+
+        self._dub_region_blur_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_region_blur', False)))
+        tk.Checkbutton(b, text='Apply Region Blur to the dubbed video',
+                       variable=self._dub_region_blur_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 8, 'bold'),
+                       command=lambda: self.update_setting(
+                           'dub_region_blur', self._dub_region_blur_var.get())
+                       ).pack(anchor='w', pady=(0, 2))
+
+        def _slider(pr, label, key, lo, hi, default, fmt):
+            sr = tk.Frame(pr, bg=AppStyles.BG_CARD)
+            sr.pack(fill='x', padx=0, pady=0)
+            tk.Label(sr, text=label, bg=AppStyles.BG_CARD,
+                     fg=AppStyles.TEXT_MEDIUM, font=('Segoe UI', 7)).pack(side='left')
+            var = tk.DoubleVar(value=self.settings.get(key, default))
+            vl = tk.Label(sr, text=fmt(var.get()), bg=AppStyles.BG_CARD,
+                          fg=AppStyles.ACCENT_PRIMARY, font=('Segoe UI', 7, 'bold'),
+                          width=4, anchor='e')
+            vl.pack(side='right')
+            tk.Scale(sr, from_=lo, to=hi, orient='horizontal', variable=var,
+                     bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                     troughcolor=AppStyles.BG_INPUT, showvalue=False,
+                     sliderlength=14, highlightthickness=0, length=120,
+                     command=lambda v, k=key, lb=vl: (
+                         self.update_setting(k, int(float(v))),
+                         lb.config(text=fmt(int(float(v)))),
+                         self._dub_touch_preview())
+                     ).pack(side='left', fill='x', expand=True, padx=(4, 4))
+            return var
+
+        # Mode: blur / cover.
+        mode_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        mode_r.pack(fill='x', pady=(2, 0))
+        tk.Label(mode_r, text='Mode:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        self._dub_rb_mode_var = tk.StringVar(
+            value=self.settings.get('region_blur_mode', 'blur'))
+        mode_cb = ttk.Combobox(mode_r, textvariable=self._dub_rb_mode_var,
+                               values=['blur', 'cover'], state='readonly', width=8)
+        mode_cb.pack(side='left', padx=(4, 0))
+        self._dub_rb_blur_frame = tk.Frame(b, bg=AppStyles.BG_CARD)
+        self._dub_rb_cover_frame = tk.Frame(b, bg=AppStyles.BG_CARD)
+        self._dub_rb_blur_frame.pack(fill='x', pady=(2, 0))
+
+        def _mode_changed(*_):
+            self.update_setting('region_blur_mode', self._dub_rb_mode_var.get())
+            self._dub_rb_blur_frame.pack_forget()
+            self._dub_rb_cover_frame.pack_forget()
+            if self._dub_rb_mode_var.get() == 'cover':
+                self._dub_rb_cover_frame.pack(fill='x', pady=(2, 0))
+            else:
+                self._dub_rb_blur_frame.pack(fill='x', pady=(2, 0))
+            self._dub_touch_preview()
+        mode_cb.bind('<<ComboboxSelected>>', lambda e: _mode_changed())
+
+        # Per-side toggles + sliders (2x2).
+        def _side(col_label, size_key, enable_key, lo, hi, default):
+            col = tk.Frame(self._dub_rb_blur_frame, bg=AppStyles.BG_CARD)
+            col.pack(side='left', fill='x', expand=True, padx=2)
+            en = tk.BooleanVar(value=self.settings.get(enable_key, False))
+            tk.Checkbutton(col, text=col_label, variable=en,
+                           bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                           activebackground=AppStyles.BG_CARD,
+                           selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 7),
+                           command=lambda: (
+                               self.update_setting(enable_key, en.get()),
+                               self._dub_touch_preview())
+                           ).pack(anchor='w')
+            sr = tk.Frame(col, bg=AppStyles.BG_CARD)
+            sr.pack(fill='x')
+            sv = tk.DoubleVar(value=self.settings.get(size_key, default))
+            sl = tk.Label(sr, text=f'{int(sv.get())}%', bg=AppStyles.BG_CARD,
+                          fg=AppStyles.ACCENT_PRIMARY, font=('Segoe UI', 7, 'bold'))
+            sl.pack()
+            tk.Scale(sr, from_=lo, to=hi, orient='horizontal', variable=sv,
+                     bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                     troughcolor=AppStyles.BG_INPUT, showvalue=False,
+                     sliderlength=14, highlightthickness=0, length=40,
+                     command=lambda v, k=size_key, lb=sl: (
+                         self.update_setting(k, int(float(v))),
+                         lb.config(text=f'{int(float(v))}%'),
+                         self._dub_touch_preview())
+                     ).pack(fill='x')
+        s1 = tk.Frame(self._dub_rb_blur_frame, bg=AppStyles.BG_CARD)
+        s1.pack(fill='x', pady=(2, 0))
+        _side('▴ Top', 'blur_top_size', 'blur_enable_top', 5, 100, 20)
+        _side('▾ Bot', 'blur_bottom_size', 'blur_enable_bottom', 5, 100, 20)
+        s2 = tk.Frame(self._dub_rb_blur_frame, bg=AppStyles.BG_CARD)
+        s2.pack(fill='x')
+        _side('◂ Left', 'blur_left_size', 'blur_enable_left', 5, 100, 20)
+        _side('▸ Right', 'blur_right_size', 'blur_enable_right', 5, 100, 20)
+
+        # Crop spinboxes.
+        crop_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        crop_r.pack(fill='x', padx=0, pady=(2, 0))
+        tk.Label(crop_r, text='Crop:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 7, 'bold')).pack(side='left')
+        for clabel, ckey, cdefault in [('T:', 'blur_crop_top', 0),
+                                       ('B:', 'blur_crop_bottom', 30),
+                                       ('L:', 'blur_crop_left', 0),
+                                       ('R:', 'blur_crop_right', 0)]:
+            sf = tk.Frame(crop_r, bg=AppStyles.BG_CARD)
+            sf.pack(side='left', padx=(1, 0))
+            tk.Label(sf, text=clabel, bg=AppStyles.BG_CARD,
+                     fg=AppStyles.TEXT_MEDIUM, font=('Segoe UI', 6)).pack(side='left')
+            sv = tk.IntVar(value=self.settings.get(ckey, cdefault))
+            tk.Spinbox(sf, from_=0, to=50, width=2, textvariable=sv,
+                       bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                       font=('Segoe UI', 7), relief='flat', bd=0,
+                       command=lambda k=ckey, v=sv: (
+                           self.update_setting(k, v.get()),
+                           self._dub_touch_preview())).pack(side='left')
+            sv.trace_add('write', lambda *_, k=ckey, v=sv: (
+                self.update_setting(k, v.get()), self._dub_touch_preview()))
+
+        # Blur mode controls: intensity, tint+opacity, feather.
+        _slider(self._dub_rb_blur_frame, 'Intensity:', 'blur_intensity',
+                1, 100, 15, lambda v: f'{int(v)}')
+        tint_r = tk.Frame(self._dub_rb_blur_frame, bg=AppStyles.BG_CARD)
+        tint_r.pack(fill='x', padx=0, pady=(2, 0))
+        tv = tk.BooleanVar(value=self.settings.get('blur_color_tint_enabled', False))
+        tk.Checkbutton(tint_r, text='Tint', variable=tv, bg=AppStyles.BG_CARD,
+                       fg=AppStyles.TEXT_DARK, activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 7),
+                       command=lambda: (
+                           self.update_setting('blur_color_tint_enabled', tv.get()),
+                           self._dub_touch_preview())).pack(side='left')
+        self._dub_rb_tint_var = tk.StringVar(
+            value=self.settings.get('blur_tint_color', '#000000'))
+        _sw = tk.Label(tint_r, text='  ', bg=self._dub_rb_tint_var.get(),
+                       relief='solid', borderwidth=1)
+        _sw.pack(side='left', padx=(2, 1))
+        tk.Entry(tint_r, textvariable=self._dub_rb_tint_var, width=5,
+                 bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                 font=('Segoe UI', 7), relief='flat').pack(side='left')
+
+        def _pk_tint():
+            c = colorchooser.askcolor(title='Blur Tint',
+                                      initialcolor=self._dub_rb_tint_var.get())
+            if c and c[1]:
+                self._dub_rb_tint_var.set(c[1])
+                _sw.config(bg=c[1])
+                self.update_setting('blur_tint_color', c[1])
+                self._dub_touch_preview()
+        ModernButton(tint_r, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 6), padx=2, pady=0,
+                     command=_pk_tint).pack(side='left', padx=1)
+        self._dub_rb_tint_var.trace_add('write', lambda *_: (
+            self.update_setting('blur_tint_color', self._dub_rb_tint_var.get()),
+            _sw.config(bg=self._dub_rb_tint_var.get()),
+            self._dub_touch_preview()))
+        _slider(tint_r, 'Op:', 'blur_tint_opacity', 0, 100, 50,
+                lambda v: f'{int(v)}%')
+        fe = tk.BooleanVar(value=self.settings.get('blur_feather_edge', True))
+        tk.Checkbutton(self._dub_rb_blur_frame, text='Feather Edge', variable=fe,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 7),
+                       command=lambda: (
+                           self.update_setting('blur_feather_edge', fe.get()),
+                           self._dub_touch_preview())).pack(anchor='w', pady=(2, 0))
+
+        # Cover mode controls: color, opacity, round.
+        cc_r = tk.Frame(self._dub_rb_cover_frame, bg=AppStyles.BG_CARD)
+        cc_r.pack(fill='x', padx=0, pady=(2, 0))
+        tk.Label(cc_r, text='Cover Color:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 7, 'bold')).pack(side='left')
+        self._dub_rb_cover_color_var = tk.StringVar(
+            value=self.settings.get('cover_color', '#000000'))
+        _cc_sw = tk.Label(cc_r, text='  ', bg=self._dub_rb_cover_color_var.get(),
+                          relief='solid', borderwidth=1)
+        _cc_sw.pack(side='left', padx=(2, 1))
+        tk.Entry(cc_r, textvariable=self._dub_rb_cover_color_var, width=6,
+                 bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                 font=('Segoe UI', 7), relief='flat').pack(side='left')
+
+        def _pk_cc():
+            c = colorchooser.askcolor(title='Cover Color',
+                                      initialcolor=self._dub_rb_cover_color_var.get())
+            if c and c[1]:
+                self._dub_rb_cover_color_var.set(c[1])
+                _cc_sw.config(bg=c[1])
+                self.update_setting('cover_color', c[1])
+                self._dub_touch_preview()
+        ModernButton(cc_r, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 6), padx=2, pady=0,
+                     command=_pk_cc).pack(side='left', padx=1)
+        self._dub_rb_cover_color_var.trace_add('write', lambda *_: (
+            self.update_setting('cover_color', self._dub_rb_cover_color_var.get()),
+            _cc_sw.config(bg=self._dub_rb_cover_color_var.get()),
+            self._dub_touch_preview()))
+        _slider(self._dub_rb_cover_frame, 'Opacity:', 'cover_opacity',
+                0, 100, 85, lambda v: f'{int(v)}%')
+        _slider(self._dub_rb_cover_frame, 'Round:', 'cover_radius',
+                0, 30, 8, lambda v: f'{int(v)}px')
+
+        # ── Border ──
+        tk.Label(b, text='── Border ──', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_MEDIUM, font=('Segoe UI', 7, 'bold')
+                 ).pack(anchor='w', padx=0, pady=(2, 0))
+        self._dub_rb_border_enabled_var = tk.BooleanVar(
+            value=self.settings.get('cleanup_border_enabled', False))
+        tk.Checkbutton(b, text='Add Border', variable=self._dub_rb_border_enabled_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD, selectcolor=AppStyles.BG_INPUT,
+                       font=('Segoe UI', 8, 'bold'),
+                       command=lambda: (
+                           self.update_setting('cleanup_border_enabled',
+                                               self._dub_rb_border_enabled_var.get()),
+                           self._dub_touch_preview())).pack(anchor='w', padx=0, pady=(1, 0))
+        bc_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        bc_r.pack(fill='x', padx=0, pady=(2, 0))
+        tk.Label(bc_r, text='Color:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 7)).pack(side='left')
+        self._dub_rb_border_color_var = tk.StringVar(
+            value=self.settings.get('cleanup_border_color', '#FFFFFF'))
+        tk.Entry(bc_r, textvariable=self._dub_rb_border_color_var,
+                 bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                 font=('Segoe UI', 7), width=6, relief='flat').pack(side='left', padx=(3, 1))
+        self._dub_rb_border_swatch = tk.Label(
+            bc_r, text='    ', bg=self._dub_rb_border_color_var.get(),
+            relief='solid', borderwidth=1)
+        self._dub_rb_border_swatch.pack(side='left', padx=(0, 2))
+
+        def _pk_br():
+            c = colorchooser.askcolor(title='Border Color',
+                                      initialcolor=self._dub_rb_border_color_var.get())
+            if c and c[1]:
+                self._dub_rb_border_color_var.set(c[1])
+                self._dub_rb_border_swatch.config(bg=c[1])
+                self.update_setting('cleanup_border_color', c[1])
+                self._dub_touch_preview()
+        ModernButton(bc_r, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 6), padx=2, pady=0,
+                     command=_pk_br).pack(side='left')
+        self._dub_rb_border_color_var.trace_add('write', lambda *_: (
+            self.update_setting('cleanup_border_color',
+                                self._dub_rb_border_color_var.get()),
+            self._dub_rb_border_swatch.config(bg=self._dub_rb_border_color_var.get()),
+            self._dub_touch_preview()))
+        _slider(b, 'Size:', 'cleanup_border_size', 1, 60, 4,
+                lambda v: f'{int(v)}px')
+
+    def _dub_build_custom_blur_card(self, scrollable):
+        """Custom Blur Regions — mirror of the OurScript card (same keys)."""
+        card = self._dub_card(scrollable, '🎯 Custom Blur Regions (Hide Logos)')
+        b = tk.Frame(card, bg=AppStyles.BG_CARD)
+        b.pack(fill='x', padx=8, pady=(2, 8))
+
+        self._dub_custom_blur_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_custom_blur', False)))
+        tk.Checkbutton(b, text='Apply Custom Blur Regions to the dubbed video',
+                       variable=self._dub_custom_blur_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 8, 'bold'),
+                       command=lambda: self.update_setting(
+                           'dub_custom_blur', self._dub_custom_blur_var.get())
+                       ).pack(anchor='w', pady=(0, 2))
+
+        custom = self.settings.get('custom_blur_regions', []) or []
+        self._dub_cb_stat = tk.Label(
+            b, text='', bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+            font=('Segoe UI', 8))
+        self._dub_cb_stat.pack(anchor='w')
+        self._dub_cb_list_frame = tk.Frame(b, bg=AppStyles.BG_CARD)
+        self._dub_cb_list_frame.pack(fill='x', padx=2)
+
+        btns = tk.Frame(b, bg=AppStyles.BG_CARD)
+        btns.pack(fill='x', pady=(2, 0))
+        ModernButton(btns, text='+ Add', bg_color=AppStyles.BG_INPUT,
+                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
+                     command=lambda: self._dub_cb_caption_dialog(
+                         self._dub_cb_stat)).pack(side='left', padx=(0, 2))
+        ModernButton(btns, text='Blur Mid', bg_color='#d69e2e',
+                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
+                     command=lambda: self._os_bb_add_middle_region(
+                         self._dub_cb_stat, self._dub_cb_stat,
+                         '_dub_cb', self._dub_touch_preview)).pack(side='left', padx=(0, 2))
+        ModernButton(btns, text='Inpaint ▼', bg_color='#22c55e',
+                     font=('Segoe UI', 8, 'bold'), padx=4, pady=1,
+                     command=lambda: self._os_bb_add_inpaint_region(
+                         self._dub_cb_stat, self._dub_cb_stat,
+                         '_dub_cb', self._dub_touch_preview)).pack(side='left', padx=(0, 2))
+        ModernButton(btns, text='Ref', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 7), padx=4, pady=1,
+                     command=lambda: self._os_bb_rebuild_cb_list(
+                         self._dub_cb_stat, self._dub_cb_stat,
+                         '_dub_cb', self._dub_touch_preview)).pack(side='left')
+
+        # X/Y/W/H sliders.
+        self._dub_cb_x_var = tk.IntVar(value=5)
+        self._dub_cb_y_var = tk.IntVar(value=35)
+        self._dub_cb_w_var = tk.IntVar(value=90)
+        self._dub_cb_h_var = tk.IntVar(value=22)
+        for row_data in [
+                [('→ X', 'x', self._dub_cb_x_var, 0, 95),
+                 ('⬇ Y', 'y', self._dub_cb_y_var, 0, 75)],
+                [('↔ W', 'width', self._dub_cb_w_var, 20, 100),
+                 ('≡ H', 'height', self._dub_cb_h_var, 5, 40)]]:
+            r = tk.Frame(b, bg=AppStyles.BG_CARD)
+            r.pack(fill='x', padx=1, pady=0)
+            for label, key, var, lo, hi in row_data:
+                sr = tk.Frame(r, bg=AppStyles.BG_CARD)
+                sr.pack(side='left', fill='x', expand=True, padx=0)
+                tk.Label(sr, text=label, bg=AppStyles.BG_CARD,
+                         fg=AppStyles.TEXT_DARK, font=('Segoe UI', 6, 'bold')).pack(anchor='w')
+                tk.Scale(sr, from_=lo, to=hi, resolution=1, orient='horizontal',
+                         variable=var, bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                         troughcolor=AppStyles.BG_INPUT, length=35, sliderlength=8,
+                         font=('Segoe UI', 5)).pack(fill='x')
+                var.trace_add('write', lambda *_, k=key, v=var: (
+                    self._os_bb_update_middle_region(
+                        k, v.get(), self._dub_touch_preview)))
+
+        # Mode: blur / inpaint.
+        mode_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        mode_r.pack(fill='x', padx=2, pady=(2, 0))
+        tk.Label(mode_r, text='Mode:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._dub_cb_mode_var = tk.StringVar(value='blur')
+        mc = ttk.Combobox(mode_r, textvariable=self._dub_cb_mode_var,
+                          values=['blur', 'inpaint'], state='readonly', width=8)
+        mc.pack(side='left', padx=(4, 0))
+        mc.bind('<<ComboboxSelected>>', lambda e: (
+            self._os_bb_update_middle_region(
+                'mode', self._dub_cb_mode_var.get(), self._dub_touch_preview)))
+        tk.Label(mode_r, text='Blur=hide  Inpaint=AI remove',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 5, 'italic')).pack(side='right')
+
+        # Fill color.
+        fc_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        fc_r.pack(fill='x', padx=2, pady=(2, 0))
+        tk.Label(fc_r, text='Fill:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._dub_cb_fill_color_var = tk.StringVar(value='#000000')
+        _fc_sw = tk.Label(fc_r, text='  ', bg=self._dub_cb_fill_color_var.get(),
+                          relief='solid', borderwidth=1, width=2)
+        _fc_sw.pack(side='left', padx=(2, 1))
+        tk.Entry(fc_r, textvariable=self._dub_cb_fill_color_var, width=6,
+                 bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+                 font=('Segoe UI', 7), relief='flat').pack(side='left')
+
+        def _pk_fc():
+            c = colorchooser.askcolor(title='Fill Color',
+                                      initialcolor=self._dub_cb_fill_color_var.get())
+            if c and c[1]:
+                self._dub_cb_fill_color_var.set(c[1])
+                _fc_sw.config(bg=c[1])
+                self._os_bb_update_middle_color(c[1], self._dub_touch_preview)
+        ModernButton(fc_r, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 6), padx=2, pady=0,
+                     command=_pk_fc).pack(side='left', padx=1)
+        self._dub_cb_fill_color_var.trace_add('write', lambda *_: (
+            self._os_bb_update_middle_color(
+                self._dub_cb_fill_color_var.get(), self._dub_touch_preview),
+            _fc_sw.config(bg=self._dub_cb_fill_color_var.get())))
+
+        # Fill opacity.
+        fo_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        fo_r.pack(fill='x', padx=2, pady=(0, 1))
+        tk.Label(fo_r, text='Opacity:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._dub_cb_fill_opacity_var = tk.IntVar(value=0)
+        fo_v = tk.Label(fo_r, text='80%', bg=AppStyles.BG_CARD,
+                        fg=AppStyles.ACCENT_PRIMARY, font=('Segoe UI', 7, 'bold'), width=3)
+        fo_v.pack(side='right')
+        tk.Scale(fo_r, from_=0, to=100, orient='horizontal',
+                 variable=self._dub_cb_fill_opacity_var,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 highlightthickness=0, troughcolor=AppStyles.BG_INPUT,
+                 showvalue=False, sliderlength=8, length=35,
+                 command=lambda v, lb=fo_v: (
+                     self._os_bb_update_middle_region(
+                         'fill_opacity', int(float(v)), self._dub_touch_preview),
+                     lb.config(text=f'{int(float(v))}%')
+                 )).pack(side='left', fill='x', expand=True, padx=2)
+
+        # Pill (cover) toggle + round slider.
+        cov_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        cov_r.pack(fill='x', padx=2)
+        self._dub_cb_cover_mode_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(cov_r, text='Pill (cover)', variable=self._dub_cb_cover_mode_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 7),
+                       command=lambda: self._os_bb_update_middle_region(
+                           'cover_mode', self._dub_cb_cover_mode_var.get(),
+                           self._dub_touch_preview)).pack(side='left')
+        cr_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        cr_r.pack(fill='x', padx=2)
+        tk.Label(cr_r, text='Round:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8, 'bold')).pack(side='left')
+        self._dub_cb_cover_radius_var = tk.IntVar(value=8)
+        cr_v = tk.Label(cr_r, text='8 px', bg=AppStyles.BG_CARD,
+                        fg=AppStyles.ACCENT_PRIMARY, font=('Segoe UI', 7, 'bold'), width=3)
+        cr_v.pack(side='right')
+        tk.Scale(cr_r, from_=0, to=30, orient='horizontal',
+                 variable=self._dub_cb_cover_radius_var,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 highlightthickness=0, troughcolor=AppStyles.BG_INPUT,
+                 showvalue=False, sliderlength=8, length=35,
+                 command=lambda v, lb=cr_v: (
+                     self._os_bb_update_middle_region(
+                         'cover_radius', int(float(v)), self._dub_touch_preview),
+                     lb.config(text=f'{int(float(v))} px')
+                 )).pack(side='left', fill='x', expand=True, padx=2)
+
+        # Build the region list + count.
+        self._os_bb_rebuild_cb_list(self._dub_cb_stat, self._dub_cb_stat,
+                                    '_dub_cb', self._dub_touch_preview)
+
+    def _dub_build_title_card(self, scrollable):
+        """Title Text — mirror of the OurScript card (same keys)."""
+        card = self._dub_card(scrollable, '🅣 Title Text')
+        b = tk.Frame(card, bg=AppStyles.BG_CARD)
+        b.pack(fill='x', padx=8, pady=(2, 8))
+
+        self._dub_title_text_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_title_text', False)))
+        tk.Checkbutton(b, text='Apply Title Text to the dubbed video',
+                       variable=self._dub_title_text_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 8, 'bold'),
+                       command=lambda: self.update_setting(
+                           'dub_title_text', self._dub_title_text_var.get())
+                       ).pack(anchor='w', pady=(0, 2))
+
+        self._dub_title_text_widget = tk.Text(
+            b, height=2, wrap='word', bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+            font=('Segoe UI', 9), relief='flat')
+        self._dub_title_text_widget.pack(fill='x', pady=(0, 3))
+        _t = self.settings.get('our_script_title_text', '') or ''
+        if _t:
+            self._dub_title_text_widget.insert('1.0', _t)
+        self._dub_title_text_widget.bind(
+            '<KeyRelease>',
+            lambda e: self.update_setting(
+                'our_script_title_text',
+                self._dub_title_text_widget.get('1.0', 'end-1c')))
+
+        grid = tk.Frame(b, bg=AppStyles.BG_CARD)
+        grid.pack(fill='x')
+        grid.columnconfigure(0, weight=1, uniform='dub_tt')
+        grid.columnconfigure(1, weight=1, uniform='dub_tt')
+        lcol = tk.Frame(grid, bg=AppStyles.BG_CARD)
+        lcol.grid(row=0, column=0, sticky='nsew', padx=(0, 3))
+        rcol = tk.Frame(grid, bg=AppStyles.BG_CARD)
+        rcol.grid(row=0, column=1, sticky='nsew', padx=(3, 0))
+
+        def _color_row(parent, label, key, default, pick_title):
+            row = tk.Frame(parent, bg=AppStyles.BG_CARD)
+            row.pack(fill='x', pady=1)
+            tk.Label(row, text=label, bg=AppStyles.BG_CARD,
+                     fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                     width=7, anchor='w').pack(side='left')
+            var = tk.StringVar(value=self.settings.get(key, default))
+            sw = tk.Label(row, text='     ', bg=var.get(), relief='solid', borderwidth=1)
+            sw.pack(side='left', padx=(2, 1))
+            tk.Entry(row, textvariable=var, bg=AppStyles.BG_INPUT,
+                     fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                     width=7, relief='flat').pack(side='left', padx=(2, 1))
+
+            def _pick():
+                c = colorchooser.askcolor(title=pick_title, initialcolor=var.get())
+                if c and c[1]:
+                    var.set(c[1])
+                    sw.config(bg=c[1])
+                    self.update_setting(key, c[1])
+            ModernButton(row, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                         font=('Segoe UI', 8), padx=4, pady=1,
+                         command=_pick).pack(side='left')
+            return var, sw
+        tc_var, tc_sw = _color_row(lcol, 'Text:', 'our_script_title_text_color',
+                                   '#FFFFFF', 'Choose Title Text Color')
+        bg_var, bg_sw = _color_row(lcol, 'BG:', 'our_script_title_bg_color',
+                                   '#000000', 'Choose Title Background Color')
+
+        # Position.
+        pos_r = tk.Frame(lcol, bg=AppStyles.BG_CARD)
+        pos_r.pack(fill='x', pady=1)
+        tk.Label(pos_r, text='Position:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                 width=7, anchor='w').pack(side='left')
+        self._dub_title_pos_var = tk.StringVar(
+            value=self.settings.get('our_script_title_position', 'top'))
+        pc = ttk.Combobox(pos_r, textvariable=self._dub_title_pos_var,
+                          values=['top', 'center', 'bottom'], state='readonly', width=8)
+        pc.pack(side='left', padx=(2, 0))
+        pc.bind('<<ComboboxSelected>>', lambda e: self.update_setting(
+            'our_script_title_position', self._dub_title_pos_var.get()))
+
+        # V-Offset.
+        voff_r = tk.Frame(lcol, bg=AppStyles.BG_CARD)
+        voff_r.pack(fill='x', pady=1)
+        tk.Label(voff_r, text='V-Offset:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                 width=7, anchor='w').pack(side='left')
+        self._dub_title_vo_var = tk.IntVar(
+            value=int(self.settings.get('vertical_offset', 0)))
+        voff_l = tk.Label(voff_r, text='0px', bg=AppStyles.BG_CARD,
+                          fg=AppStyles.ACCENT_PRIMARY, font=('Segoe UI', 8, 'bold'),
+                          width=4, anchor='e')
+        voff_l.pack(side='right')
+        tk.Scale(voff_r, from_=-200, to=200, orient='horizontal',
+                 variable=self._dub_title_vo_var, length=55,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=voff_l: (
+                     self.update_setting('vertical_offset', int(v)),
+                     lb.config(text=f"{'+' if int(v) >= 0 else ''}{int(v)}px"),
+                     self._dub_touch_preview())
+                 ).pack(side='left', fill='x', expand=True, padx=(0, 2))
+
+        # Size.
+        fs_r = tk.Frame(rcol, bg=AppStyles.BG_CARD)
+        fs_r.pack(fill='x', pady=1)
+        tk.Label(fs_r, text='Size:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                 width=7, anchor='w').pack(side='left')
+        self._dub_title_fs_var = tk.IntVar(
+            value=int(self.settings.get('our_script_title_font_size', 70)))
+        fs_l = tk.Label(fs_r, text=str(self._dub_title_fs_var.get()),
+                        bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                        font=('Segoe UI', 8, 'bold'))
+        fs_l.pack(side='right', padx=(4, 0))
+        tk.Scale(fs_r, from_=12, to=200, orient='horizontal',
+                 variable=self._dub_title_fs_var, length=55,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=fs_l: (
+                     self.update_setting('our_script_title_font_size', int(v)),
+                     lb.config(text=str(int(v))),
+                     self._dub_touch_preview())
+                 ).pack(side='left', padx=(2, 0))
+
+        # BG opacity.
+        op_r = tk.Frame(rcol, bg=AppStyles.BG_CARD)
+        op_r.pack(fill='x', pady=1)
+        tk.Label(op_r, text='BG op:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                 width=7, anchor='w').pack(side='left')
+        self._dub_title_op_var = tk.IntVar(
+            value=int(self.settings.get('our_script_title_bg_opacity', 80)))
+        op_l = tk.Label(op_r, text=f'{self._dub_title_op_var.get()}%',
+                        bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                        font=('Segoe UI', 8, 'bold'))
+        op_l.pack(side='right', padx=(4, 0))
+        tk.Scale(op_r, from_=0, to=100, orient='horizontal',
+                 variable=self._dub_title_op_var, length=55,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=op_l: (
+                     self.update_setting('our_script_title_bg_opacity', int(v)),
+                     lb.config(text=f'{int(v)}%'),
+                     self._dub_touch_preview())
+                 ).pack(side='left', padx=(2, 0))
+
+        # Round corners.
+        rd_r = tk.Frame(rcol, bg=AppStyles.BG_CARD)
+        rd_r.pack(fill='x', pady=1)
+        tk.Label(rd_r, text='Round:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                 width=7, anchor='w').pack(side='left')
+        self._dub_title_radius_var = tk.IntVar(
+            value=int(self.settings.get('our_script_title_bg_radius', 12)))
+        rd_l = tk.Label(rd_r, text=f'{self._dub_title_radius_var.get()}px',
+                        bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                        font=('Segoe UI', 8, 'bold'))
+        rd_l.pack(side='right', padx=(4, 0))
+        tk.Scale(rd_r, from_=0, to=50, orient='horizontal',
+                 variable=self._dub_title_radius_var, length=55,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=rd_l: (
+                     self.update_setting('our_script_title_bg_radius', int(v)),
+                     lb.config(text=f'{int(v)}px'),
+                     self._dub_touch_preview())
+                 ).pack(side='left', padx=(2, 0))
+
+        tk.Label(b, text='   Same shared settings as the OurScript > Title Text card.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), wraplength=520,
+                 justify='left').pack(anchor='w', pady=(2, 0))
+
+    def _dub_build_bottom_text_card(self, scrollable):
+        """Bottom Text CTA — mirror of the OurScript card (same keys)."""
+        card = self._dub_card(scrollable, '📄 Bottom Text (CTA at bottom)')
+        b = tk.Frame(card, bg=AppStyles.BG_CARD)
+        b.pack(fill='x', padx=8, pady=(2, 8))
+
+        self._dub_bottom_text_var = tk.BooleanVar(
+            value=bool(self.settings.get('dub_bottom_text', False)))
+        tk.Checkbutton(b, text='Apply Bottom Text CTA to the dubbed video',
+                       variable=self._dub_bottom_text_var,
+                       bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                       activebackground=AppStyles.BG_CARD,
+                       selectcolor=AppStyles.BG_INPUT, font=('Segoe UI', 8, 'bold'),
+                       command=lambda: self.update_setting(
+                           'dub_bottom_text', self._dub_bottom_text_var.get())
+                       ).pack(anchor='w', pady=(0, 2))
+
+        self._dub_bottom_text_widget = tk.Text(
+            b, height=2, wrap='word', bg=AppStyles.BG_INPUT, fg=AppStyles.TEXT_DARK,
+            font=('Segoe UI', 9), relief='flat')
+        self._dub_bottom_text_widget.pack(fill='x', pady=(0, 3))
+        _bt = self.settings.get('bottom_text_content', '') or ''
+        if _bt:
+            self._dub_bottom_text_widget.insert('1.0', _bt)
+        self._dub_bottom_text_widget.bind(
+            '<KeyRelease>',
+            lambda e: self.update_setting(
+                'bottom_text_content',
+                self._dub_bottom_text_widget.get('1.0', 'end-1c')))
+
+        row = tk.Frame(b, bg=AppStyles.BG_CARD)
+        row.pack(fill='x', pady=(2, 0))
+
+        # Font family.
+        tk.Label(row, text='Font:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        self._dub_bt_font_var = tk.StringVar(
+            value=self.settings.get('bottom_text_font_family', 'Arial'))
+        fonts = self.get_system_fonts('bottom_text') if hasattr(
+            self, 'get_system_fonts') else ['Arial']
+        fc = ttk.Combobox(row, textvariable=self._dub_bt_font_var,
+                          values=fonts, state='readonly', width=12)
+        fc.pack(side='left', padx=(2, 6))
+        fc.bind('<<ComboboxSelected>>', lambda e: self.update_setting(
+            'bottom_text_font_family', self._dub_bt_font_var.get()))
+
+        # Size.
+        tk.Label(row, text='Size:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        self._dub_bt_fs_var = tk.IntVar(
+            value=int(self.settings.get('bottom_text_font_size', 45)))
+        fs_l = tk.Label(row, text=str(self._dub_bt_fs_var.get()),
+                        bg=AppStyles.BG_CARD, fg=AppStyles.ACCENT_PRIMARY,
+                        font=('Segoe UI', 8, 'bold'))
+        fs_l.pack(side='left', padx=(2, 0))
+        tk.Scale(row, from_=12, to=200, orient='horizontal',
+                 variable=self._dub_bt_fs_var, length=45,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=fs_l: (
+                     self.update_setting('bottom_text_font_size', int(v)),
+                     lb.config(text=str(int(v))),
+                     self._dub_touch_preview())
+                 ).pack(side='left', padx=(2, 4))
+
+        # Text color.
+        tk.Label(row, text='Color:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        self._dub_bt_tc_var = tk.StringVar(
+            value=self.settings.get('bottom_text_text_color', '#FFFFFF'))
+        self._dub_bt_tc_swatch = tk.Frame(row, bg=self._dub_bt_tc_var.get(),
+                                          width=16, height=14, relief='solid',
+                                          borderwidth=1)
+        self._dub_bt_tc_swatch.pack(side='left', padx=(2, 2))
+
+        def _pick_tc():
+            c = colorchooser.askcolor(title='Bottom Text Color',
+                                      initialcolor=self._dub_bt_tc_var.get())
+            if c and c[1]:
+                self._dub_bt_tc_var.set(c[1])
+                self._dub_bt_tc_swatch.config(bg=c[1])
+                self.update_setting('bottom_text_text_color', c[1])
+        ModernButton(row, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 8), padx=4, pady=0,
+                     command=_pick_tc).pack(side='left', padx=(0, 6))
+
+        # BG color.
+        tk.Label(row, text='BG:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        self._dub_bt_bgc_var = tk.StringVar(
+            value=self.settings.get('bottom_text_bg_color', '#000000'))
+        self._dub_bt_bgc_swatch = tk.Frame(row, bg=self._dub_bt_bgc_var.get(),
+                                           width=16, height=14, relief='solid',
+                                           borderwidth=1)
+        self._dub_bt_bgc_swatch.pack(side='left', padx=(2, 2))
+
+        def _pick_bgc():
+            c = colorchooser.askcolor(title='Bottom Text BG Color',
+                                      initialcolor=self._dub_bt_bgc_var.get())
+            if c and c[1]:
+                self._dub_bt_bgc_var.set(c[1])
+                self._dub_bt_bgc_swatch.config(bg=c[1])
+                self.update_setting('bottom_text_bg_color', c[1])
+        ModernButton(row, text='🎨', bg_color=AppStyles.ACCENT_INFO,
+                     font=('Segoe UI', 8), padx=4, pady=0,
+                     command=_pick_bgc).pack(side='left', padx=(0, 6))
+
+        # BG opacity.
+        tk.Label(row, text='Opacity:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8)).pack(side='left')
+        self._dub_bt_op_var = tk.IntVar(
+            value=int(self.settings.get('bottom_text_bg_opacity', 80)))
+        op_l = tk.Label(row, text=f'{self._dub_bt_op_var.get()}%',
+                        bg=AppStyles.BG_CARD, fg=AppStyles.ACCENT_PRIMARY,
+                        font=('Segoe UI', 8, 'bold'))
+        op_l.pack(side='left', padx=(2, 0))
+        tk.Scale(row, from_=0, to=100, orient='horizontal',
+                 variable=self._dub_bt_op_var, length=40,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=op_l: (
+                     self.update_setting('bottom_text_bg_opacity', int(v)),
+                     lb.config(text=f'{int(v)}%'),
+                     self._dub_touch_preview())
+                 ).pack(side='left', padx=(2, 0))
+
+        # V-Offset.
+        voff_r = tk.Frame(b, bg=AppStyles.BG_CARD)
+        voff_r.pack(fill='x', pady=(2, 0))
+        tk.Label(voff_r, text='V-Offset:', bg=AppStyles.BG_CARD,
+                 fg=AppStyles.TEXT_DARK, font=('Segoe UI', 8),
+                 width=7, anchor='w').pack(side='left')
+        self._dub_bt_vo_var = tk.IntVar(
+            value=int(self.settings.get('bottom_text_vertical_offset', 0)))
+        voff_l = tk.Label(voff_r, text='0px', bg=AppStyles.BG_CARD,
+                          fg=AppStyles.ACCENT_PRIMARY, font=('Segoe UI', 8, 'bold'),
+                          width=4, anchor='e')
+        voff_l.pack(side='right')
+        tk.Scale(voff_r, from_=-200, to=200, orient='horizontal',
+                 variable=self._dub_bt_vo_var, length=55,
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 troughcolor=AppStyles.BG_INPUT, highlightthickness=0,
+                 command=lambda v, lb=voff_l: (
+                     self.update_setting('bottom_text_vertical_offset', int(v)),
+                     lb.config(text=f"{'+' if int(v) >= 0 else ''}{int(v)}px"),
+                     self._dub_touch_preview())
+                 ).pack(side='left', fill='x', expand=True, padx=(0, 2))
+
+        tk.Label(b, text='   Same shared settings as the OurScript > Bottom Text card.',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_MEDIUM,
+                 font=('Segoe UI', 8, 'italic'), wraplength=520,
+                 justify='left').pack(anchor='w', pady=(2, 0))
 
     def _dub_refresh_am_status(self):
         """Show which Alight Motion template is currently selected (it is
@@ -1239,21 +2249,43 @@ class DubbingTabMixin:
                 lambda: self._dub_detect_btn.config(state='normal'))
 
     # ── Logging (thread-safe via after) ─────────────────────────────────
-    def _dub_log(self, level, msg):
-        icons = {'ok': '✅', 'error': '❌', 'warn': '⚠', 'info': 'ℹ',
-                 'path': '📁', 'header': '━'}
-        line = f"{icons.get(level, '·')} {msg}\n"
+    def _dub_log(self, level, msg, max_lines=2000):
+        """Append a timestamped line to the dub log widget, mirroring the
+        Our Script tab's ``_os_log`` format (timestamp + colored tag)."""
+        if not hasattr(self, '_dub_log_widget'):
+            return
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime('%H:%M:%S')
+        if level not in ('info', 'ok', 'warn', 'error', 'path', 'header'):
+            level = 'info'
 
         def _append():
             try:
-                self._dub_log_widget.insert('end', line)
-                self._dub_log_widget.see('end')
+                w = self._dub_log_widget
+                w.configure(state='normal')
+                w.insert('end', f'[{ts}] ', 'ts')
+                w.insert('end', msg + '\n', level)
+                # Trim to max_lines to avoid runaway memory.
+                try:
+                    line_count = int(w.index('end-1c').split('.')[0])
+                    if line_count > max_lines:
+                        cut = line_count - int(max_lines * 0.75)
+                        w.delete('1.0', f'{cut}.0')
+                except Exception:
+                    pass
+                if (getattr(self, '_dub_log_autoscroll_var', None) is not None
+                        and self._dub_log_autoscroll_var.get()):
+                    w.see('end')
+                w.configure(state='disabled')
+                if hasattr(self, '_dub_log_lines_var'):
+                    cur = w.index('end-1c').split('.')[0]
+                    self._dub_log_lines_var.set(f'{cur} lines')
             except Exception:
                 pass
         try:
             self._dub_log_widget.after(0, _append)
         except Exception:
-            print(line, end='')
+            print(f'[{ts}] {msg}')
 
     def _dub_set_status(self, text):
         try:
@@ -1336,6 +2368,318 @@ class DubbingTabMixin:
             target=self._dub_worker,
             args=(src, out_video, lang, src_lang), daemon=True)
         t.start()
+
+    def _dub_preview_source(self) -> Path | None:
+        """Pick the video the overlay preview should be drawn on: the single
+        Source Video, else the first video in the batch folder."""
+        v = (self._dub_video_var.get() or '').strip()
+        if v and Path(v).is_file():
+            return Path(v)
+        folder = (self._dub_folder_var.get() or '').strip()
+        if folder and Path(folder).is_dir():
+            recursive = bool(self._dub_batch_recursive_var.get())
+            vids = self._dub_scan_folder(folder, recursive)
+            if vids:
+                self._dub_video_var.set(str(vids[0]))
+                return vids[0]
+        return None
+
+    def _dub_preview_overlays(self):
+        """Render a single-frame preview of the dub overlays (blur / title /
+        bottom text / caption position) and open it, so the user can position
+        elements before running the full (slow) dub."""
+        if getattr(self, '_dub_running', False):
+            self._dub_log('warn', 'A dub is running — please wait.')
+            return
+        src = self._dub_preview_source()
+        if src is None:
+            messagebox.showerror(
+                'Dubbing', 'Pick a video (or set a batch folder) to preview on.')
+            return
+        self._dub_preview_btn.config(state='disabled')
+        self._dub_set_status(f'Previewing overlays on {Path(src).name}…')
+        self._dub_log('info', f'Preview: overlays on {Path(src).name} …')
+
+        def _run():
+            try:
+                png = dubbing_engine.preview_dub_overlays(
+                    src, self.settings, self._dub_log)
+                self._dub_video_widget_after(
+                    lambda: (os.startfile(str(png)),
+                             self._dub_set_status(
+                                 f'Preview ready → {Path(png).name}')))
+            except Exception as e:
+                self._dub_log('error', f'Preview failed: {e}')
+                for ln in traceback.format_exc().splitlines():
+                    self._dub_log('error', f'  {ln}')
+                self._dub_video_widget_after(
+                    lambda: self._dub_set_status('Preview failed.'))
+            finally:
+                self._dub_video_widget_after(
+                    lambda: self._dub_preview_btn.config(state='normal'))
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+    # ── Live overlay preview (mirrors the Our Script tab's scrub preview) ──
+    def _dub_open_live_preview(self, *_):
+        """Open a scrubbable Toplevel showing the dub overlays LIVE.
+
+        Mirrors the Our Script tab's ``_os_open_live_preview``: a portrait
+        canvas, a timeline scrub slider, and a time label.  Dragging the
+        slider re-renders ONE frame at that time with the SAME overlay view
+        the dub effects render builds (region/custom blur, title text,
+        bottom-text CTA) plus the caption text active at that moment — so the
+        user can position every element before running the full (slow) dub.
+        """
+        if getattr(self, '_dub_running', False):
+            self._dub_log('warn', 'A dub is running — please wait.')
+            return
+        src = self._dub_preview_source()
+        if src is None:
+            messagebox.showerror(
+                'Dubbing', 'Pick a video (or set a batch folder) to preview on.')
+            return
+
+        if getattr(self, '_dub_lp_window', None) is not None:
+            try:
+                self._dub_lp_window.destroy()
+            except Exception:
+                pass
+            self._dub_lp_window = None
+        self._dub_lp_rendering = False
+
+        from PIL import Image, ImageTk  # type: ignore
+
+        win = tk.Toplevel(self.root)
+        win.title(f'🔍 Dub Live Preview — {Path(src).name}')
+        win.configure(bg=AppStyles.BG_CARD)
+        win.transient(self.root)
+        win.resizable(False, False)
+        self._dub_lp_window = win
+
+        # Scratch state for the preview.
+        self._dub_lp_video = Path(src)
+        self._dub_lp_img = None          # latest rendered PIL image
+        self._dub_lp_photo = None        # keep a ref so Tk doesn't GC it
+        self._dub_lp_preview_scale = 1.0
+
+        top = tk.Frame(win, bg=AppStyles.BG_CARD)
+        top.pack(fill='x', padx=10, pady=(10, 4))
+        tk.Label(top, text=f'Scrub to position   •   {Path(src).name}',
+                 bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                 font=('Segoe UI', 9, 'bold')).pack(side='left')
+
+        # Time vars (duration filled in after first frame).
+        self._dub_lp_time_var = tk.DoubleVar(value=0.0)
+        self._dub_lp_dur_var = tk.DoubleVar(value=0.0)
+
+        # Canvas — portrait phone box like the Our Script preview.
+        canvas_w, canvas_h = 270, 480
+        self._dub_lp_canvas = tk.Canvas(
+            win, width=canvas_w, height=canvas_h, bg='#000',
+            highlightbackground='#30363d', highlightthickness=1)
+        self._dub_lp_canvas.pack(padx=10, pady=(2, 4))
+
+        # Scrub row: time label + slider.
+        scrub_row = tk.Frame(win, bg=AppStyles.BG_CARD)
+        scrub_row.pack(fill='x', padx=10, pady=(0, 2))
+        self._dub_lp_time_label = tk.Label(
+            scrub_row, text='0:00 / 0:00', bg=AppStyles.BG_CARD,
+            fg=AppStyles.TEXT_MEDIUM, font=('Consolas', 8))
+        self._dub_lp_time_label.pack(side='left', anchor='w')
+        self._dub_lp_scrub = ttk.Scale(
+            scrub_row, orient='horizontal', from_=0, to=1.0,
+            variable=self._dub_lp_time_var,
+            command=self._dub_live_preview_refresh, length=240)
+        self._dub_lp_scrub.pack(side='right', fill='x', expand=True, padx=(8, 0))
+
+        # Bottom row: overlay toggles + Refresh + Close.
+        btn_row = tk.Frame(win, bg=AppStyles.BG_CARD)
+        btn_row.pack(fill='x', padx=10, pady=(2, 10))
+
+        # Left side: toggles
+        toggles = tk.Frame(btn_row, bg=AppStyles.BG_CARD)
+        toggles.pack(side='left', fill='x', expand=True)
+        tk.Label(toggles, text='Draw in preview:',
+                bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+                font=('Segoe UI', 8, 'bold')).pack(side='left', padx=(0, 6))
+
+        self._dub_preview_show_blur_var = tk.BooleanVar(
+            value=self.settings.get('dub_preview_show_blur', True))
+        tk.Checkbutton(
+            toggles, text='🌫 Blur',
+            variable=self._dub_preview_show_blur_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT,
+            activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8),
+            command=lambda: (
+                self.update_setting('dub_preview_show_blur',
+                                    self._dub_preview_show_blur_var.get()),
+                self._dub_live_preview_refresh())).pack(side='left', padx=2)
+
+        self._dub_preview_show_title_var = tk.BooleanVar(
+            value=self.settings.get('dub_preview_show_title', True))
+        tk.Checkbutton(
+            toggles, text='🅣 Title',
+            variable=self._dub_preview_show_title_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT,
+            activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8),
+            command=lambda: (
+                self.update_setting('dub_preview_show_title',
+                                    self._dub_preview_show_title_var.get()),
+                self._dub_live_preview_refresh())).pack(side='left', padx=2)
+
+        self._dub_preview_show_caption_var = tk.BooleanVar(
+            value=self.settings.get('dub_preview_show_caption', True))
+        tk.Checkbutton(
+            toggles, text='📝 Caption',
+            variable=self._dub_preview_show_caption_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT,
+            activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8),
+            command=lambda: (
+                self.update_setting('dub_preview_show_caption',
+                                    self._dub_preview_show_caption_var.get()),
+                self._dub_live_preview_refresh())).pack(side='left', padx=2)
+
+        self._dub_preview_show_bottom_var = tk.BooleanVar(
+            value=self.settings.get('dub_preview_show_bottom', True))
+        tk.Checkbutton(
+            toggles, text='📄 Bottom',
+            variable=self._dub_preview_show_bottom_var,
+            bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
+            selectcolor=AppStyles.BG_INPUT,
+            activebackground=AppStyles.BG_CARD,
+            font=('Segoe UI', 8),
+            command=lambda: (
+                self.update_setting('dub_preview_show_bottom',
+                                    self._dub_preview_show_bottom_var.get()),
+                self._dub_live_preview_refresh())).pack(side='left', padx=2)
+
+        # Right side: Refresh + Close
+        btn_right = tk.Frame(btn_row, bg=AppStyles.BG_CARD)
+        btn_right.pack(side='right')
+        self._dub_lp_refresh_btn = ModernButton(
+            btn_right, text='🔄 Refresh', bg_color=AppStyles.ACCENT_INFO,
+            hover_color='#0891b2', font=('Segoe UI', 9, 'bold'),
+            padx=10, pady=4, command=self._dub_live_preview_refresh)
+        self._dub_lp_refresh_btn.pack(side='left', padx=(0, 4))
+        ModernButton(
+            btn_right, text='✖ Close', bg_color=AppStyles.ACCENT_DANGER,
+            hover_color='#dc2626', font=('Segoe UI', 9, 'bold'),
+            padx=10, pady=4, command=win.destroy).pack(side='left')
+        win.protocol('WM_DELETE_WINDOW', self._dub_lp_close)
+
+        # First render.
+        self._dub_live_preview_refresh()
+        self._dub_lp_canvas.after(0, self._dub_lp_canvas.focus_set)
+
+    def _dub_lp_close(self):
+        win = getattr(self, '_dub_lp_window', None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._dub_lp_window = None
+        self._dub_lp_photo = None
+
+    def _dub_caption_at(self, t: float) -> str:
+        """Best placeholder caption text active at time *t*.
+
+        Uses the cached diarized segments from "Detect Speakers" when they
+        belong to the current preview video — the real dialogue at that
+        moment — else a generic placeholder.  (Actual TRANSLATED lines only
+        exist after a full dub run.)
+        """
+        src = getattr(self, '_dub_lp_video', None)
+        segs = getattr(self, '_dub_detected_segments', None)
+        det_video = getattr(self, '_dub_detected_video', None)
+        if segs and src and det_video and Path(det_video) == src:
+            for s in segs:
+                st = float(s.get('start', 0) or 0)
+                en = float(s.get('end', 0) or 0)
+                txt = (s.get('text') or '').strip()
+                if txt and st <= t < en:
+                    return txt
+        return 'Translated captions appear here'
+
+    def _dub_live_preview_refresh(self, *_):
+        """Re-render the preview frame at the scrub position and display it."""
+        if not hasattr(self, '_dub_lp_canvas'):
+            return
+        # Debounce: a re-render already queued covers this slider tick.
+        if getattr(self, '_dub_lp_rendering', False):
+            return
+        self._dub_lp_rendering = True
+
+        def _render():
+            try:
+                t = max(0.0, float(self._dub_lp_time_var.get() or 0.0))
+                # Probe duration once (cheap) so the scrub + label have a range.
+                try:
+                    import cv2
+                    cap = cv2.VideoCapture(str(self._dub_lp_video))
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    nf = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    cap.release()
+                    dur = (nf / fps) if fps > 0 and nf > 0 else 0.0
+                except Exception:
+                    dur = 0.0
+                if dur > 0:
+                    self._dub_video_widget_after(lambda: (
+                        self._dub_lp_dur_var.set(dur),
+                        self._dub_lp_scrub.configure(to=max(dur, 1.0))))
+                cap_text = self._dub_caption_at(t)
+                img = dubbing_engine.render_dub_overlay_frame(
+                    self._dub_lp_video, self.settings, time_sec=t,
+                    log=self._dub_log, caption_text=cap_text)
+                self._dub_video_widget_after(
+                    lambda: self._dub_lp_show(img, t))
+            except Exception as e:
+                self._dub_log('error', f'Live preview failed: {e}')
+            finally:
+                self._dub_lp_rendering = False
+
+        threading.Thread(target=_render, daemon=True).start()
+
+    def _dub_lp_show(self, img, time_sec: float):
+        """Fit *img* onto the canvas, record the display scale, show it."""
+        if not hasattr(self, '_dub_lp_canvas'):
+            return
+        try:
+            from PIL import ImageTk  # type: ignore
+
+            w, h = img.size
+            cw = self._dub_lp_canvas.winfo_width() or 270
+            ch = self._dub_lp_canvas.winfo_height() or 480
+            if cw < 50:
+                cw = 270
+            if ch < 50:
+                ch = 480
+            scale = min(cw / w, ch / h, 1.0)
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            self._dub_lp_preview_scale = float(nw) / float(w) if w else 1.0
+
+            photo = ImageTk.PhotoImage(img.resize((nw, nh)))
+            self._dub_lp_photo = photo  # keep a reference
+            self._dub_lp_canvas.delete('all')
+            self._dub_lp_canvas.create_image(
+                cw // 2, ch // 2, image=photo, anchor='center')
+
+            dur = float(self._dub_lp_dur_var.get() or 0.0)
+            self._dub_lp_time_label.config(
+                text=f'{int(time_sec // 60)}:{int(time_sec % 60):02d} / '
+                     f'{int(dur // 60)}:{int(dur % 60):02d}')
+        except Exception:
+            # Window was destroyed while the render thread ran — ignore.
+            pass
 
     def _dub_batch_worker(self, vids, lang: str, src_lang: str):
         """Dub every video in *vids* one-by-one on this worker thread.

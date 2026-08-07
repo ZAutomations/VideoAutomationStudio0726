@@ -6547,8 +6547,10 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             self._os_open_live_preview()
     
 
-    def _os_bb_add_middle_region(self, parent, status_label):
+    def _os_bb_add_middle_region(self, parent, status_label, pf='_os_cb', preview=None):
         """One-click add a middle-caption blur region preset (frosted glass)."""
+        if preview is None:
+            preview = getattr(self, '_os_open_live_preview', None) or (lambda: None)
         regions = self.settings.get('custom_blur_regions', []) or []
         clean = {
             'x': 5, 'y': 35, 'width': 90, 'height': 22,
@@ -6567,28 +6569,26 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             regions.append(clean.copy())
         self.update_setting('custom_blur_regions', regions)
         # Sync the global convenience sliders to match the preset values
-        if hasattr(self, '_os_cb_fill_color_var'):
-            self._os_cb_fill_color_var.set('#FFFFFF')
-        if hasattr(self, '_os_cb_fill_opacity_var'):
-            self._os_cb_fill_opacity_var.set(8)
-        if hasattr(self, '_os_cb_cover_mode_var'):
-            self._os_cb_cover_mode_var.set(False)
-        if hasattr(self, '_os_cb_cover_radius_var'):
-            self._os_cb_cover_radius_var.set(8)
-        if hasattr(self, '_os_cb_x_var'):
-            self._os_cb_x_var.set(5)
-        if hasattr(self, '_os_cb_y_var'):
-            self._os_cb_y_var.set(35)
-        if hasattr(self, '_os_cb_w_var'):
-            self._os_cb_w_var.set(90)
-        if hasattr(self, '_os_cb_h_var'):
-            self._os_cb_h_var.set(22)
-        self._os_bb_rebuild_cb_list(parent, status_label)
-        self._os_open_live_preview()
-    
+        def _setv(name, value):
+            v = getattr(self, f'{pf}_{name}_var', None)
+            if v is not None:
+                v.set(value)
+        _setv('fill_color', '#FFFFFF')
+        _setv('fill_opacity', 8)
+        _setv('cover_mode', False)
+        _setv('cover_radius', 8)
+        _setv('x', 5)
+        _setv('y', 35)
+        _setv('w', 90)
+        _setv('h', 22)
+        self._os_bb_rebuild_cb_list(parent, status_label, pf, preview)
+        preview()
 
-    def _os_bb_add_inpaint_region(self, parent, status_label):
+
+    def _os_bb_add_inpaint_region(self, parent, status_label, pf='_os_cb', preview=None):
         """Add a preset inpaint region for removing bottom captions."""
+        if preview is None:
+            preview = getattr(self, '_os_open_live_preview', None) or (lambda: None)
         regions = self.settings.get('custom_blur_regions', []) or []
         clean = {
             'x': 0, 'y': 82, 'width': 100, 'height': 18,
@@ -6606,32 +6606,37 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
         if not replaced:
             regions.append(clean.copy())
         self.update_setting('custom_blur_regions', regions)
-        if hasattr(self, '_os_cb_mode_var'):
-            self._os_cb_mode_var.set('inpaint')
-        if hasattr(self, '_os_cb_x_var'):
-            self._os_cb_x_var.set(0)
-            self._os_cb_y_var.set(82)
-            self._os_cb_w_var.set(100)
-            self._os_cb_h_var.set(18)
-        if hasattr(self, '_os_cb_cover_mode_var'):
-            self._os_cb_cover_mode_var.set(False)
-        self._os_bb_rebuild_cb_list(parent, status_label)
-        self._os_open_live_preview()
+        _m = getattr(self, f'{pf}_mode_var', None)
+        if _m is not None:
+            _m.set('inpaint')
+        _x = getattr(self, f'{pf}_x_var', None)
+        if _x is not None:
+            _x.set(0)
+            getattr(self, f'{pf}_y_var').set(82)
+            getattr(self, f'{pf}_w_var').set(100)
+            getattr(self, f'{pf}_h_var').set(18)
+        _cm = getattr(self, f'{pf}_cover_mode_var', None)
+        if _cm is not None:
+            _cm.set(False)
+        self._os_bb_rebuild_cb_list(parent, status_label, pf, preview)
+        preview()
 
-    def _os_bb_update_middle_region(self, key, value):
+    def _os_bb_update_middle_region(self, key, value, preview=None):
         """Update a property on the first enabled custom blur region."""
+        if preview is None:
+            preview = getattr(self, '_os_open_live_preview', None) or (lambda: None)
         regions = self.settings.get('custom_blur_regions', []) or []
         for region in regions:
             if isinstance(region, dict) and region.get('enabled', False):
                 region[key] = value
                 break
         self.update_setting('custom_blur_regions', regions)
-        self._os_open_live_preview()
-    
+        preview()
 
-    def _os_bb_update_middle_color(self, hex_color):
+
+    def _os_bb_update_middle_color(self, hex_color, preview=None):
         """Update fill_color on the first enabled region."""
-        self._os_bb_update_middle_region('fill_color', hex_color)
+        self._os_bb_update_middle_region('fill_color', hex_color, preview)
     
 
     def _os_start_preview_5s(self):
@@ -7039,11 +7044,20 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
 
     # ── Blur & Border helpers (compact Custom Blur Region editing) ──────
 
-    def _os_bb_rebuild_cb_list(self, cb_col, cb_stat):
-        """Rebuild the compact checkbox list of custom blur regions."""
-        if not hasattr(self, '_os_cb_list_frame'):
+    def _os_bb_rebuild_cb_list(self, cb_col, cb_stat, pf='_os_cb', preview=None):
+        """Rebuild the compact checkbox list of custom blur regions.
+
+        ``pf`` is the attribute prefix for the region widgets (``_os_cb`` for the
+        OurScript tab, ``_dub_cb`` for the Dubbing tab) so both tabs share this
+        exact list UI against their own controls; ``preview`` is the callback to
+        refresh the live preview (defaults to the OurScript one).
+        """
+        if preview is None:
+            preview = getattr(self, '_os_open_live_preview', None) or (lambda: None)
+        list_frame = getattr(self, f'{pf}_list_frame', None)
+        if list_frame is None:
             return
-        for child in self._os_cb_list_frame.winfo_children():
+        for child in list_frame.winfo_children():
             child.destroy()
         custom_regions = self.settings.get('custom_blur_regions', []) or []
         enabled_count = 0
@@ -7058,14 +7072,14 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             ry = region.get('y', 0)
             rw = region.get('width', 0)
             rh = region.get('height', 0)
-            rfr = tk.Frame(self._os_cb_list_frame, bg=AppStyles.BG_CARD)
+            rfr = tk.Frame(list_frame, bg=AppStyles.BG_CARD)
             rfr.pack(fill='x', pady=0)
             rv = tk.BooleanVar(value=en)
             def _mk_toggle(i):
                 return lambda: (
                     self._os_bb_toggle_custom_region(i, rv.get()),
-                    self._os_bb_rebuild_cb_list(cb_col, cb_stat),
-                    self._os_open_live_preview())
+                    self._os_bb_rebuild_cb_list(cb_col, cb_stat, pf, preview),
+                    preview())
             tk.Checkbutton(rfr, variable=rv, command=_mk_toggle(idx),
                           bg=AppStyles.BG_CARD, fg=AppStyles.TEXT_DARK,
                           activebackground=AppStyles.BG_CARD,
@@ -7080,19 +7094,21 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
                         font=('Segoe UI', 6), padx=2, pady=0,
                         command=lambda i=idx: (
                             self._os_bb_delete_custom_region(i),
-                            self._os_bb_rebuild_cb_list(cb_col, cb_stat),
-                            self._os_open_live_preview())).pack(side='right')
+                            self._os_bb_rebuild_cb_list(cb_col, cb_stat, pf, preview),
+                            preview())).pack(side='right')
         cb_stat.config(text=f'{enabled_count} of {len(custom_regions)} enabled')
         # Sync mode selector with first enabled region
         for region in custom_regions:
             if isinstance(region, dict) and region.get('enabled', False):
-                if hasattr(self, '_os_cb_mode_var'):
-                    self._os_cb_mode_var.set(region.get('mode', 'blur'))
-                if hasattr(self, '_os_cb_x_var'):
-                    self._os_cb_x_var.set(region.get('x', 0))
-                    self._os_cb_y_var.set(region.get('y', 0))
-                    self._os_cb_w_var.set(region.get('width', 100))
-                    self._os_cb_h_var.set(region.get('height', 10))
+                _m = getattr(self, f'{pf}_mode_var', None)
+                if _m is not None:
+                    _m.set(region.get('mode', 'blur'))
+                _x = getattr(self, f'{pf}_x_var', None)
+                if _x is not None:
+                    _x.set(region.get('x', 0))
+                    getattr(self, f'{pf}_y_var').set(region.get('y', 0))
+                    getattr(self, f'{pf}_w_var').set(region.get('width', 100))
+                    getattr(self, f'{pf}_h_var').set(region.get('height', 10))
                 break
 
     def _os_bb_toggle_custom_region(self, idx, enabled):
@@ -7107,13 +7123,21 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             custom_regions.pop(idx)
             self.settings['custom_blur_regions'] = custom_regions
 
-    def _os_bb_add_custom_region(self, cb_col, cb_stat):
+    def _os_bb_add_custom_region(self, cb_col, cb_stat, pf='_os_cb', preview=None,
+                                 master=None):
         """Add a new custom blur region via a simple dialog."""
-        dg = tk.Toplevel(self)
+        if preview is None:
+            preview = getattr(self, '_os_open_live_preview', None) or (lambda: None)
+        # The host VideoAutomationGUI is NOT a Tk widget (real root is self.root),
+        # so a bare tk.Toplevel(self) raises and is silently swallowed. Use the
+        # actual root so the dialog reliably opens from both the OurScript and
+        # Dubbing tabs.
+        root = master or getattr(self, 'root', None) or self
+        dg = tk.Toplevel(root)
         dg.title('Add Custom Blur Region')
         dg.geometry('420x340')
         dg.configure(bg=AppStyles.BG_CARD)
-        dg.transient(self)
+        dg.transient(root)
         dg.grab_set()
         fr = tk.Frame(dg, bg=AppStyles.BG_CARD, padx=16, pady=12)
         fr.pack(fill='both', expand=True)
@@ -7155,8 +7179,8 @@ class VideoAutomationGUI(DubbingTabMixin, ThumbnailTabMixin):
             custom_regions.append(new_r)
             self.settings['custom_blur_regions'] = custom_regions
             dg.destroy()
-            self._os_bb_rebuild_cb_list(cb_col, cb_stat)
-            self._os_open_live_preview()
+            self._os_bb_rebuild_cb_list(cb_col, cb_stat, pf, preview)
+            preview()
         btn_fr = tk.Frame(fr, bg=AppStyles.BG_CARD)
         btn_fr.pack(pady=12)
         ModernButton(btn_fr, text='💾 Save', bg_color=AppStyles.ACCENT_SUCCESS,

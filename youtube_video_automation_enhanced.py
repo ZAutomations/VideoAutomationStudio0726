@@ -4790,6 +4790,79 @@ def apply_enabled_effects_to_clip(clip, settings, log=None, apply_am=True):
         except Exception as e:
             _log('warn', f'[EFFECTS] luma wipe: {e}')
 
+    # 1.5) Our-Script overlays (region blur, custom blur, title text, bottom
+    #      text CTA) — reused so the Dubbing output can carry the same visual
+    #      look as the Our Script tab.  Each is gated by its own dubbing
+    #      checkbox (dub_region_blur / dub_custom_blur / dub_title_text /
+    #      dub_bottom_text), independent of the Blur/Our-Script tabs' own
+    #      enabled flags.
+    _ov = None
+    if (s.get('dub_region_blur', False) or s.get('dub_custom_blur', False)
+            or s.get('dub_title_text', False) or s.get('dub_bottom_text', False)):
+        try:
+            import numpy as np
+            from PIL import Image, ImageDraw
+            # Build an overlay-settings view: force the blur sources that the
+            # dubbing toggles asked for, ignore the ones they didn't.
+            _ov = dict(s)
+            _ov['region_blur_enabled'] = bool(s.get('dub_region_blur', False))
+            custom = s.get('custom_blur_regions', []) or []
+            if s.get('dub_custom_blur', False):
+                _ov['custom_blur_regions'] = [
+                    {**r, 'enabled': True}
+                    for r in custom if isinstance(r, dict) and r.get('enabled')]
+            else:
+                _ov['custom_blur_regions'] = []
+            _has_blur = _ov['region_blur_enabled'] or bool(_ov['custom_blur_regions'])
+            _has_txt = bool(s.get('dub_title_text', False)) or bool(
+                s.get('dub_bottom_text', False))
+
+            def _os_overlay(get_frame, t):
+                fr = get_frame(t)
+                if _has_blur:
+                    try:
+                        fr = VideoEffects.apply_region_blur(fr, _ov)
+                    except Exception as e:
+                        _log('warn', f'[EFFECTS] region blur skipped: {e}')
+                if _has_txt:
+                    try:
+                        img = Image.fromarray(fr).convert('RGBA')
+                        draw = ImageDraw.Draw(img, 'RGBA')
+                        if s.get('dub_title_text', False):
+                            tt = (s.get('our_script_title_text', '') or '').strip()
+                            if tt:
+                                _draw_text_simple(
+                                    draw, img, tt,
+                                    s.get('our_script_title_position', 'top'),
+                                    s.get('our_script_title_text_color', '#FFFFFF'),
+                                    s.get('our_script_title_bg_color', '#000000'),
+                                    int(s.get('our_script_title_bg_opacity', 80)),
+                                    int(s.get('our_script_title_font_size', 70)),
+                                    s.get('our_script_title_font_family', 'Arial'),
+                                    y_offset=int(s.get('vertical_offset', 0)),
+                                )
+                        if s.get('dub_bottom_text', False):
+                            bt = (s.get('bottom_text_content', '') or '').strip()
+                            if bt:
+                                _draw_text_simple(
+                                    draw, img, bt, 'bottom',
+                                    s.get('bottom_text_text_color', '#FFFFFF'),
+                                    s.get('bottom_text_bg_color', '#000000'),
+                                    int(s.get('bottom_text_bg_opacity', 80)),
+                                    int(s.get('bottom_text_font_size', 45)),
+                                    s.get('bottom_text_font_family', 'Arial'),
+                                    y_offset=int(s.get('bottom_text_vertical_offset', 0)),
+                                )
+                        fr = np.asarray(img.convert('RGB'))
+                    except Exception as e:
+                        _log('warn', f'[EFFECTS] text overlay skipped: {e}')
+                return fr
+
+            # MoviePy 2.x: transform(fn) where fn(get_frame, t) → frame.
+            clip = clip.transform(_os_overlay)
+        except Exception as e:
+            _log('warn', f'[EFFECTS] Our-Script overlays skipped: {e}')
+
     # 2) Light-leak / lens-flare / film-burn overlays, composited on top.
     overlays = []
     w, h = clip.w, clip.h
@@ -16677,6 +16750,7 @@ def _draw_text_simple(draw, pil_img, text, position, text_color, bg_color, alpha
     If bg_radius is provided (pixels at full res), it overrides the
     auto-computed radius (font_size * 0.15)."""
     from PIL import ImageFont
+    from pathlib import Path
     scale = 1.0
     eff_fs = max(10, int(round(font_size * scale)))
     eff_pad_x = max(4, int(round(font_size * 0.5 * scale)))
@@ -16687,20 +16761,38 @@ def _draw_text_simple(draw, pil_img, text, position, text_color, bg_color, alpha
     else:
         eff_radius = max(2, int(round(font_size * 0.15 * scale)))
     eff_gap = max(1, int(round(font_size * 0.2 * scale)))
-    # Find font
-    font = None
-    for cand in [
-        f'{font_family}.ttf',
-        f'{font_family.split()[0]}.ttf',
-        'C:/Windows/Fonts/arialbd.ttf',
-        'C:/Windows/Fonts/arial.ttf',
-    ]:
+
+    # ── Font resolution — MIRROR the Our Script preview exactly so bundled
+    #    preset fonts (Anton, DM Serif Display, etc.) actually resolve ──────
+    _pv_font_map = {
+        "Arial": "arial.ttf", "Arial Black": "ariblk.ttf",
+        "Arial Bold": "arialbd.ttf", "Arial Italic": "ariali.ttf",
+        "Arial Bold Italic": "arialbi.ttf",
+        "Calibri": "calibri.ttf", "Calibri Bold": "calibrib.ttf",
+        "Segoe UI": "segoeui.ttf", "Segoe UI Bold": "segoeuib.ttf",
+        "Times New Roman": "times.ttf", "Times New Roman Bold": "timesbd.ttf",
+        "Verdana": "verdana.ttf", "Verdana Bold": "verdanab.ttf",
+        "Georgia": "georgia.ttf", "Georgia Bold": "georgiab.ttf",
+        "Impact": "impact.ttf",
+    }
+    _pv_fn = _pv_font_map.get(font_family)
+    _pv_fp = None
+    if _pv_fn is None:
+        # Bundled/trending fonts (e.g. "Luckiest Guy", "Anton", "DM Serif Display")
+        # aren't in the map — resolve them via caption_fonts so the preview matches the render.
         try:
-            font = ImageFont.truetype(cand, eff_fs)
-            break
+            import caption_fonts as _cf
+            _pv_fp = _cf.resolve_font_path(font_family)
         except Exception:
-            continue
-    if font is None:
+            _pv_fp = None
+        if _pv_fp is None:
+            _pv_fn = 'arialbd.ttf'
+    else:
+        _pv_fp = str(Path(r"C:\Windows\Fonts") / _pv_fn)
+    _pv_fp = str(_pv_fp) if _pv_fp else ''
+    try:
+        font = ImageFont.truetype(_pv_fp, eff_fs) if _pv_fp and Path(_pv_fp).exists() else ImageFont.truetype('arialbd.ttf', eff_fs)
+    except Exception:
         font = ImageFont.load_default()
     # Word-wrap
     lines = []
